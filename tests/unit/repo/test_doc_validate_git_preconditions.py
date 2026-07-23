@@ -279,21 +279,21 @@ class TestRpWrap04StderrCapture:
         """RP-wrap-04 pass criteria must include the full pipx upgrade message.
 
         The Pass-criteria line must document the full value of the disabled
-        message including the ``pipx upgrade missing-package-manager`` suffix, so testers
+        message including the ``pipx upgrade mpm-cli`` suffix, so testers
         can grep for the complete string.
 
         Arrange: Read docs/integration-testing.md and extract the RP-wrap-04
         section.
-        Act: Search the block for ``pipx upgrade missing-package-manager``.
-        Assert: ``pipx upgrade missing-package-manager`` is present, confirming the full
+        Act: Search the block for ``pipx upgrade mpm-cli``.
+        Assert: ``pipx upgrade mpm-cli`` is present, confirming the full
         message is documented in the pass criteria.
         """
         content = _read_doc()
         block = _extract_scenario_block(content, "RP-wrap-04")
-        assert "pipx upgrade missing-package-manager" in block, (
+        assert "pipx upgrade mpm-cli" in block, (
             "RP-wrap-04 pass criteria does not include the full pipx upgrade suffix. "
-            "Expected 'pipx upgrade missing-package-manager' to appear in the pass criteria line "
+            "Expected 'pipx upgrade mpm-cli' to appear in the pass criteria line "
             "(e.g., 'stderr contains selfupdate is not available -- upgrade mpm "
-            "instead: pipx upgrade missing-package-manager').\n"
+            "instead: pipx upgrade mpm-cli').\n"
             f"Block content:\n{block}"
         )

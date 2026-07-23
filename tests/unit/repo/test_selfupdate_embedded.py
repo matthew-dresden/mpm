@@ -61,7 +61,7 @@ def test_selfupdate_embedded_prints_message_to_stderr(monkeypatch: pytest.Monkey
 @pytest.mark.unit
 def test_selfupdate_embedded_message_exact_text(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC-FUNC-002: The message text must exactly match the required string."""
-    expected = "selfupdate is not available -- upgrade mpm instead: pipx upgrade missing-package-manager"
+    expected = "selfupdate is not available -- upgrade mpm instead: pipx upgrade mpm-cli"
     assert SELFUPDATE_EMBEDDED_MESSAGE == expected, (
         f"SELFUPDATE_EMBEDDED_MESSAGE must be exactly {expected!r}, got {SELFUPDATE_EMBEDDED_MESSAGE!r}"
     )
