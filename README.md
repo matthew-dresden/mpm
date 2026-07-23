@@ -1,7 +1,35 @@
-# mpm (Missing Package Manager)
+# mpm — the Missing Package Manager
 
-A standalone Python CLI for managing versioned DevOps automation packages
-via declarative manifests.
+Every language has a package manager. Python has pip, Rust has cargo,
+JavaScript has npm, Java has Maven and Gradle. You point it at a manifest and
+it pulls the right versions of the right things, reproducibly, on every
+machine. Then you step outside the language — and it's gone.
+
+Terraform modules and other IaC, Kubernetes manifests and Helm charts, CI/CD
+pipeline templates, Jinja2 and other config templates, policy bundles, shell
+tooling, linter and formatter configs, agent skills and prompt libraries, and
+the Markdown that encodes your team's operational knowledge — none of it has a
+package manager. It gets copy-pasted between repos, vendored by hand, pinned by
+nobody, and drifts until something breaks. The substrate every real platform
+runs on is the one part of the stack with no dependency manager.
+
+**mpm is the missing one.** It brings the package-manager model — a declarative
+manifest, resolved and locked versions, reproducible installs, and
+`outdated` / `why` / `update` — to everything that never had it. Anything you
+can put in a Git repository and tag with a version, mpm can declare as a
+dependency, resolve, pin in a lockfile, and pull into a workspace. IaC, k8s,
+pipelines, templates, policies, tool configs, and knowledge — managed like real
+dependencies instead of artisanal copies.
+
+It matters more now, not less. AI coding agents run on exactly this substrate —
+shared skills, prompt libraries, tool configurations, and Markdown knowledge
+bases — and all of it needs to be versioned, discoverable, and reproducible.
+mpm treats a knowledge base or an agent skill pack the same way pip treats a
+wheel.
+
+> **How to talk about it:** the project is **mpm**; in prose, call it **"the
+> Missing Package Manager"** — the dependency manager for the platform and AI
+> spaces that no language package manager ever covered.
 
 **License:** Apache 2.0
 
@@ -231,14 +259,28 @@ install` steps and explains the lockfile model that replaces hand-editing
 
 ---
 
-## What is MPM?
+## What is mpm?
 
-MPM is a **DevOps Platform Dependency Manager** that brings
-version-controlled, reproducible automation to your projects through
-declarative manifests. MPM enables you to centralize, version, and share
-automation across your organization without replacing your existing tools.
+mpm is **the Missing Package Manager** — a dependency manager for everything
+that lives outside a programming language and therefore never got one. A
+language package manager (pip, cargo, npm, Maven/Gradle) resolves and pins the
+libraries written *in* that language. mpm does the same job for the layers
+*around* the code: infrastructure, orchestration, pipelines, templates,
+policies, tool configuration, and knowledge.
 
-**Solves a common problem:** Organizations have quality automation and operational knowledge scattered across teams -- build conventions, linting rules, security scanning, test frameworks, local dev tooling, and shared markdown documentation that work well but are not widely adopted because they are hard to discover, version, test, and distribute. MPM enables you to package this automation and share it across projects in a tested, reproducible way.
+**The gap it fills:** the highest-value, most-copied assets in a modern platform
+have no package manager at all. Terraform modules, Kubernetes and Helm
+manifests, pipeline templates, Jinja2 templates, OPA/policy bundles, linter and
+formatter configs, shell tooling, agent skills and prompt libraries, and
+operational Markdown are duplicated across repositories, hand-vendored, and
+pinned by no one. mpm lets you declare each of these as a versioned dependency,
+resolve it against Git tags, lock it, and install it reproducibly — so the
+platform substrate is managed like real dependencies instead of copy-paste.
+
+**Why now:** AI coding agents consume this same substrate — skills, prompts,
+tool configs, and Markdown knowledge bases — and need it versioned,
+discoverable, and reproducible. mpm manages an agent skill pack or a knowledge
+base exactly the way a language package manager manages a library.
 
 ### Fully customizable
 
