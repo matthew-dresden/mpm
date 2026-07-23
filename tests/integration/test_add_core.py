@@ -488,10 +488,10 @@ class TestAddCoreSourceNameDerivation:
 
 @pytest.mark.integration
 class TestAddCoreMPMFileEnvVar:
-    """--mpm-file defaults from MPM_MPM_FILE env var when not supplied as a flag."""
+    """--mpm-file defaults from MPM_MANIFEST_FILE env var when not supplied as a flag."""
 
     def test_mpm_mpm_file_env_used_when_flag_absent(self, tmp_path: pathlib.Path) -> None:
-        """MPM_MPM_FILE env var is used when --mpm-file flag is not passed."""
+        """MPM_MANIFEST_FILE env var is used when --mpm-file flag is not passed."""
         bare = _create_manifest_repo_with_tags(
             tmp_path / "repo",
             entry_names=["entry-a"],
@@ -508,11 +508,11 @@ class TestAddCoreMPMFileEnvVar:
                 "--catalog-source",
                 f"file://{bare}@main",
             ],
-            extra_env={"MPM_MPM_FILE": str(mpm_file)},
+            extra_env={"MPM_MANIFEST_FILE": str(mpm_file)},
             cwd=workspace,
         )
         assert result.returncode == 0, f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
-        assert mpm_file.exists(), "Expected custom.mpm to be created via MPM_MPM_FILE"
+        assert mpm_file.exists(), "Expected custom.mpm to be created via MPM_MANIFEST_FILE"
 
 
 @pytest.mark.integration
@@ -961,10 +961,10 @@ class TestAddMarketplaceInstallOnNonMarketplaceType:
 
 @pytest.mark.integration
 class TestAddEnvMPMFilePrecedence:
-    """CLI --mpm-file flag takes precedence over MPM_MPM_FILE env var (E38 row 45)."""
+    """CLI --mpm-file flag takes precedence over MPM_MANIFEST_FILE env var (E38 row 45)."""
 
     def test_cli_flag_overrides_env_var(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """--mpm-file <flag_path> wins over MPM_MPM_FILE=<env_path>; env path is NOT written."""
+        """--mpm-file <flag_path> wins over MPM_MANIFEST_FILE=<env_path>; env path is NOT written."""
         bare = _create_manifest_repo_with_tags(
             tmp_path / "repo",
             entry_names=["entry-b"],
@@ -975,7 +975,7 @@ class TestAddEnvMPMFilePrecedence:
         env_path = tmp_path / "env.mpm"
         flag_path = tmp_path / "flag.mpm"
 
-        monkeypatch.setenv("MPM_MPM_FILE", str(env_path))
+        monkeypatch.setenv("MPM_MANIFEST_FILE", str(env_path))
 
         result = _run_mpm(
             [
@@ -996,4 +996,4 @@ class TestAddEnvMPMFilePrecedence:
         assert "MPM_SOURCE_entry_b_URL=" in content, f"Expected source URL line in flag.mpm; got:\n{content}"
         assert "MPM_SOURCE_entry_b_REF=" in content, f"Expected source REF line in flag.mpm; got:\n{content}"
         assert "MPM_SOURCE_entry_b_PATH=" in content, f"Expected source PATH line in flag.mpm; got:\n{content}"
-        assert not env_path.exists(), "env.mpm must NOT be written when --mpm-file flag overrides MPM_MPM_FILE"
+        assert not env_path.exists(), "env.mpm must NOT be written when --mpm-file flag overrides MPM_MANIFEST_FILE"

@@ -136,7 +136,7 @@ the alias is already mapped to a different source it is a hard
 error (use --force to overwrite, or \'mpm remove \<alias\>\'
 first). Without --as, the alias is the sanitized manifest name,
 auto-suffixed deterministically on a cross-source collision.]:alias_override:"
-  "--mpm-file[Destination .mpm file path. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Destination .mpm file path. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   "--force[Overwrite an existing alias block when re-adding the same
 package (same source\@ref), and re-pin its .mpm.lock entry
 while keeping the dep\'s NAME. Without this flag, a re-add of an
@@ -205,7 +205,7 @@ _shtab_mpm_completion_defaults_added=0
 
 _shtab_mpm_doctor_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
-  "--mpm-file[Path to the .mpm file that identifies the workspace root. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file that identifies the workspace root. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   "--lock-file[Path to the .mpm.lock lockfile. Defaults to \'\<mpm-file\>.lock\' (e.g. .\/.mpm.lock). Overridden by the MPM_LOCK_FILE environment variable.]:lock_file:"
   "--strict-drift[Promote branch-drift findings from info-level to error-level. With this flag, mpm doctor returns exit code 1 when any branch-pinned source\'s tip SHA differs from the locked SHA.]"
   "--refresh-completion-cache[Subcheck 8\: invalidate the shell completion cache under \<MPM_HOME\>\/cache\/completion-cache\/. Removes all files there and recreates the directory with mode 0700. Reports an info finding with the count of files removed.]"
@@ -236,7 +236,7 @@ _shtab_mpm_list_options=(
   "--tree[Expand each installed source to its transitive packages (from .mpm.lock).]"
   "--status[Filter to sources with the given status\: installed, not-installed, orphan.]:status:(installed not-installed orphan)"
   "--format[Output format\: \'table\' (default) or \'json\'. Overridden by the MPM_LIST_OUTPUT_FORMAT environment variable\; the CLI flag takes precedence when both are set.]:format:(table json)"
-  "--mpm-file[Path to the .mpm file. Defaults to auto-discovery (walk up from the current directory). Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file. Defaults to auto-discovery (walk up from the current directory). Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   "--lock-file[Path to the .mpm.lock file. Defaults to \<mpm-file\>.lock. Overridden by the MPM_LOCK_FILE environment variable\; the CLI flag takes precedence when both are set.]:lock_file:"
 )
 
@@ -252,7 +252,7 @@ _shtab_mpm_marketplace_defaults_added=0
 
 _shtab_mpm_marketplace_disable_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
-  "--mpm-file[Path to the .mpm file to read\/modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file to read\/modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   ":The source alias to disable (canonical alias or original entry name).:"
 )
 
@@ -261,7 +261,7 @@ _shtab_mpm_marketplace_disable_defaults_added=0
 
 _shtab_mpm_marketplace_enable_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
-  "--mpm-file[Path to the .mpm file to read\/modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file to read\/modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   ":The source alias to enable (canonical alias or original entry name).:"
 )
 
@@ -272,7 +272,7 @@ _shtab_mpm_marketplace_status_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
   "--all[Show every dependency, including those that are not a marketplace
 type. Without --all, only marketplace-typed dependencies are listed.]"
-  "--mpm-file[Path to the .mpm file to read\/modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file to read\/modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
 )
 
 # guard to ensure default positional specs are added only once per session
@@ -281,7 +281,7 @@ _shtab_mpm_marketplace_status_defaults_added=0
 _shtab_mpm_outdated_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
   "--catalog-source[Remote catalog source as \'\<git_url\>\@\<ref\>\' where ref is a branch, tag, or \'latest\'. Overrides the MPM_CATALOG_SOURCES env var. Required when MPM_CATALOG_SOURCES configures no single source.]:catalog_source:"
-  "--mpm-file[Path to the .mpm file. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   "--lock-file[Path to the .mpm.lock file. When present, provides the current resolved SHA. When absent, the command live-resolves against the catalog. Defaults to \<mpm-file\>.lock. Overridden by the MPM_LOCK_FILE environment variable\; the CLI flag takes precedence when both are set.]:lock_file:"
   "--fail-on-upgrade[Exit 1 when ANY source has an available upgrade (upgrade-type \!\= \'none\'). Default is to always exit 0 (parity with pip list --outdated, npm outdated, cargo outdated). Use this flag in CI pipelines to gate on lockfile freshness\: the build fails when any source is upgradable, prompting the operator to refresh the lockfile. Spec reference\: spec\/mpm-list-add-lock-features-spec.md Section 0.2 and Section 4.4 \'Exit code\'.]"
   "--format[Output format\: \'table\' (default) or \'json\'. The \'json\' format emits a top-level array of objects, one per source, with keys\: name, current, latest-matching-spec, latest-available, upgrade-type. Overridden by the MPM_OUTDATED_FORMAT environment variable\; the CLI flag takes precedence when both are set.]:format:(table json)"
@@ -292,7 +292,7 @@ _shtab_mpm_outdated_defaults_added=0
 
 _shtab_mpm_remove_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
-  "--mpm-file[Path to the .mpm file to modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file to modify. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   "--force[Silently skip sources that are not fully present in the .mpm file (used to clean up partially-orphaned entries). Known sources are still removed atomically.]"
   "--dry-run[Preview mode\: shows which lines would be removed. Each removed line is
 printed to stdout with a \'-\' prefix. Makes no on-disk change. Exits 0.
@@ -379,7 +379,7 @@ _shtab_mpm_validate_xml_defaults_added=0
 _shtab_mpm_why_options=(
   "(- : *)"{-h,--help}"[show this help message and exit]"
   "--catalog-source[Remote catalog source as \'\<git_url\>\@\<ref\>\' where ref is a branch, tag, or \'latest\'. Overrides the MPM_CATALOG_SOURCES env var. Required when MPM_CATALOG_SOURCES configures no single source.]:catalog_source:"
-  "--mpm-file[Path to the .mpm file. Defaults to \'.\/.mpm\'. Overridden by the MPM_MPM_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
+  "--mpm-file[Path to the .mpm file. Defaults to \'.\/.mpm\'. Overridden by the MPM_MANIFEST_FILE environment variable\; the CLI flag takes precedence when both are set.]:mpm_file:"
   "--lock-file[Path to the .mpm.lock file. When present, the tree is built from lockfile entries (no git calls). When absent, the command live-resolves against the catalog. Defaults to \<mpm-file\>.lock. Overridden by the MPM_LOCK_FILE environment variable\; the CLI flag takes precedence when both are set.]:lock_file:"
   "--format[Output format\: \'text\' (default) or \'json\'. Overridden by the MPM_WHY_FORMAT environment variable\; the CLI flag takes precedence when both are set.]:format:(text json)"
   ":The project URL, XML manifest path, source name, or transitive include name to look up. Project URLs are canonicalized via canonicalize_repo_url before matching. XML manifest paths are matched by exact string equality. Source and include names are normalized via derive_source_name (case- and separator-insensitive).:"

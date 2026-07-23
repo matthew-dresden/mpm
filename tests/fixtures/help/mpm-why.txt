@@ -40,8 +40,9 @@ options:
                         MPM_CATALOG_SOURCES env var. Required when
                         MPM_CATALOG_SOURCES configures no single source.
   --mpm-file <path>     Path to the .mpm file. Defaults to './.mpm'.
-                        Overridden by the MPM_MPM_FILE environment variable;
-                        the CLI flag takes precedence when both are set.
+                        Overridden by the MPM_MANIFEST_FILE environment
+                        variable; the CLI flag takes precedence when both are
+                        set.
   --lock-file <path>    Path to the .mpm.lock file. When present, the tree is
                         built from lockfile entries (no git calls). When
                         absent, the command live-resolves against the catalog.

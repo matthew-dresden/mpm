@@ -73,7 +73,7 @@ class TestRegisterSubparser:
         assert args.names == ["foo_bar", "baz_qux"]
 
     def test_mpm_file_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("MPM_MPM_FILE", raising=False)
+        monkeypatch.delenv("MPM_MANIFEST_FILE", raising=False)
         parser = argparse.ArgumentParser()
         subparsers = parser.add_subparsers(dest="command")
         register(subparsers)
@@ -81,7 +81,7 @@ class TestRegisterSubparser:
         assert args.mpm_file == "./.mpm"
 
     def test_mpm_file_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("MPM_MPM_FILE", "/tmp/mympm")
+        monkeypatch.setenv("MPM_MANIFEST_FILE", "/tmp/mympm")
         parser = argparse.ArgumentParser()
         subparsers = parser.add_subparsers(dest="command")
         register(subparsers)
@@ -89,7 +89,7 @@ class TestRegisterSubparser:
         assert args.mpm_file == "/tmp/mympm"
 
     def test_mpm_file_cli_flag_overrides_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("MPM_MPM_FILE", "/tmp/mympm")
+        monkeypatch.setenv("MPM_MANIFEST_FILE", "/tmp/mympm")
         parser = argparse.ArgumentParser()
         subparsers = parser.add_subparsers(dest="command")
         register(subparsers)

@@ -349,18 +349,18 @@ class TestMPMAddConstants:
     """Tests for mpm add constants (E2-F4-S1-T1 AC-FUNC-013, AC-TEST-001)."""
 
     def test_mpm_mpm_file_env_exists(self) -> None:
-        """MPM_MPM_FILE_ENV constant exists and is the string 'MPM_MPM_FILE'."""
-        from mpm_cli.constants import MPM_MPM_FILE_ENV
+        """MPM_MANIFEST_FILE_ENV constant exists and is the string 'MPM_MANIFEST_FILE'."""
+        from mpm_cli.constants import MPM_MANIFEST_FILE_ENV
 
-        assert isinstance(MPM_MPM_FILE_ENV, str)
-        assert MPM_MPM_FILE_ENV == "MPM_MPM_FILE"
+        assert isinstance(MPM_MANIFEST_FILE_ENV, str)
+        assert MPM_MANIFEST_FILE_ENV == "MPM_MANIFEST_FILE"
 
     def test_mpm_mpm_file_default_exists(self) -> None:
-        """MPM_MPM_FILE_DEFAULT constant exists and is './.mpm'."""
-        from mpm_cli.constants import MPM_MPM_FILE_DEFAULT
+        """MPM_MANIFEST_FILE_DEFAULT constant exists and is './.mpm'."""
+        from mpm_cli.constants import MPM_MANIFEST_FILE_DEFAULT
 
-        assert isinstance(MPM_MPM_FILE_DEFAULT, str)
-        assert MPM_MPM_FILE_DEFAULT == "./.mpm"
+        assert isinstance(MPM_MANIFEST_FILE_DEFAULT, str)
+        assert MPM_MANIFEST_FILE_DEFAULT == "./.mpm"
 
     def test_mpm_header_gitbase_exists(self) -> None:
         """MPM_HEADER_GITBASE constant exists and contains the template placeholder."""
@@ -451,11 +451,11 @@ class TestMPMLockFileConstant:
         assert isinstance(MPM_LOCK_FILE, str)
 
     def test_mpm_lock_file_adjacent_to_mpm_file_env(self) -> None:
-        """MPM_LOCK_FILE and MPM_MPM_FILE_ENV are both importable from constants."""
-        from mpm_cli.constants import MPM_MPM_FILE_ENV, MPM_LOCK_FILE
+        """MPM_LOCK_FILE and MPM_MANIFEST_FILE_ENV are both importable from constants."""
+        from mpm_cli.constants import MPM_MANIFEST_FILE_ENV, MPM_LOCK_FILE
 
         assert MPM_LOCK_FILE == "MPM_LOCK_FILE"
-        assert MPM_MPM_FILE_ENV == "MPM_MPM_FILE"
+        assert MPM_MANIFEST_FILE_ENV == "MPM_MANIFEST_FILE"
 
 
 @pytest.mark.unit

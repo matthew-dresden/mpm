@@ -45,8 +45,8 @@ import defusedxml.ElementTree as ET
 from mpm_cli.repo.subcmds.envsubst import _UNRESOLVED_PATTERN
 from mpm_cli.constants import (
     MPM_ALLOW_INSECURE_REMOTES,
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     MPM_LOCK_FILE,
     MPM_WHY_FORMAT,
     MPM_WHY_FORMAT_DEFAULT,
@@ -1460,12 +1460,12 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     parser.add_argument(
         "--mpm-file",
         dest="mpm_file",
-        default=os.environ.get(MPM_MPM_FILE_ENV, MPM_MPM_FILE_DEFAULT),
+        default=os.environ.get(MPM_MANIFEST_FILE_ENV, MPM_MANIFEST_FILE_DEFAULT),
         metavar="<path>",
         help=(
             f"Path to the .mpm file. "
-            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
-            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            f"Defaults to '{MPM_MANIFEST_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MANIFEST_FILE_ENV} environment variable; "
             "the CLI flag takes precedence when both are set."
         ),
     )
@@ -1528,7 +1528,7 @@ def run(args: argparse.Namespace) -> int:
     if not mpm_path.exists():
         print(
             f"ERROR: .mpm file not found: {mpm_path}\n"
-            f"Provide a valid path via --mpm-file or the {MPM_MPM_FILE_ENV} env var.",
+            f"Provide a valid path via --mpm-file or the {MPM_MANIFEST_FILE_ENV} env var.",
             file=sys.stderr,
         )
         sys.exit(1)

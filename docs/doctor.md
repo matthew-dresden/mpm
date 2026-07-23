@@ -53,7 +53,7 @@ summary line). The examples below show the messages each subcheck produces.
 #### What it inspects
 
 Whether a `.mpm` file exists in the workspace (or at the path given by
-`--mpm-file` / `MPM_MPM_FILE`). When `.mpm` is present but
+`--mpm-file` / `MPM_MANIFEST_FILE`). When `.mpm` is present but
 `.mpm.lock` is absent, an info-level notice is printed and subchecks 2-5
 and 11 are skipped. Subchecks 6-10 still run.
 
@@ -843,7 +843,7 @@ Exit code: `0` (reachability errors are advisory)
   subcommands, including `mpm doctor`
 - [docs/configuration.md](configuration.md) -- all environment variables
   (`MPM_CATALOG_SOURCES`, `MPM_HOME`, `MPM_CACHE_PRUNE_AGE_DAYS`,
-  `MPM_RESOLVE_TIMEOUT`, `MPM_GIT_RETRY_COUNT`, `MPM_MPM_FILE`,
+  `MPM_RESOLVE_TIMEOUT`, `MPM_GIT_RETRY_COUNT`, `MPM_MANIFEST_FILE`,
   `MPM_LOCK_FILE`)
 - [docs/lockfile.md](lockfile.md) -- `.mpm.lock` format, `mpm_hash`
   semantics, and lockfile-to-install-workspace mapping

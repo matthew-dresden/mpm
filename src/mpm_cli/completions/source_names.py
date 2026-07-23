@@ -9,7 +9,7 @@ Public API::
 
 Resolution chain:
 1. If MPM_COMPLETION_ENABLED=0, return [] immediately (no cache touch, no file read).
-2. Resolve the .mpm file path from ${MPM_MPM_FILE} (default: ./.mpm).
+2. Resolve the .mpm file path from ${MPM_MANIFEST_FILE} (default: ./.mpm).
 3. Read the file and extract all MPM_SOURCE_<name>_URL keys.
 4. Emit each <name> portion sorted alphabetically.
 5. Filter by prefix-match against current_token.
@@ -37,8 +37,8 @@ from pathlib import Path
 from mpm_cli.completions.cache import log_completion_error
 from mpm_cli.constants import (
     MPM_COMPLETION_ENABLED,
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     SOURCE_PREFIX,
     SOURCE_URL_SUFFIX,
 )
@@ -55,16 +55,16 @@ def _resolve_mpm_file() -> Path:
     """Return the Path to the active .mpm file.
 
     Resolution order (highest wins):
-    1. ${MPM_MPM_FILE} environment variable.
-    2. ./.mpm (MPM_MPM_FILE_DEFAULT).
+    1. ${MPM_MANIFEST_FILE} environment variable.
+    2. ./.mpm (MPM_MANIFEST_FILE_DEFAULT).
 
     Returns:
         Path to the .mpm file (may or may not exist on disk).
     """
-    env_val = os.environ.get(MPM_MPM_FILE_ENV)
+    env_val = os.environ.get(MPM_MANIFEST_FILE_ENV)
     if env_val:
         return Path(env_val)
-    return Path(MPM_MPM_FILE_DEFAULT)
+    return Path(MPM_MANIFEST_FILE_DEFAULT)
 
 
 def _extract_source_names(content: str) -> list[str]:
@@ -98,7 +98,7 @@ def complete(current_token: str) -> list[str]:
 
     Resolution contract:
     1. MPM_COMPLETION_ENABLED=0 -> return [].
-    2. Read the .mpm file from ${MPM_MPM_FILE} (default: ./.mpm).
+    2. Read the .mpm file from ${MPM_MANIFEST_FILE} (default: ./.mpm).
     3. Extract MPM_SOURCE_<name>_URL keys; return sorted <name> list.
     4. Filter by prefix (case-sensitive).
     5. On any error: log to completion-errors.log and return [].

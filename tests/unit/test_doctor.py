@@ -343,19 +343,19 @@ class TestRunDoctorHealthChecks:
         )
 
     def test_mpm_file_resolved_from_env_var(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When args.mpm_file is None, the MPM_MPM_FILE env var is used.
+        """When args.mpm_file is None, the MPM_MANIFEST_FILE env var is used.
 
         Args:
             tmp_path: Pytest-provided temporary directory.
             monkeypatch: Pytest monkeypatching fixture.
         """
         from mpm_cli.commands.doctor import run_doctor
-        from mpm_cli.constants import MPM_MPM_FILE_ENV
+        from mpm_cli.constants import MPM_MANIFEST_FILE_ENV
 
         mpm_file = tmp_path / ".mpm"
         mpm_file.write_text("MPM_MARKETPLACE_INSTALL=false\n", encoding="utf-8")
 
-        monkeypatch.setenv(MPM_MPM_FILE_ENV, str(mpm_file))
+        monkeypatch.setenv(MPM_MANIFEST_FILE_ENV, str(mpm_file))
         args = _make_refresh_args(mpm_file=None)
         result = run_doctor(args)
 
@@ -366,7 +366,7 @@ class TestRunDoctorHealthChecks:
     ) -> None:
         """When args.mpm_file is None and env var is unset, the default is used.
 
-        The default is MPM_MPM_FILE_DEFAULT (typically '.mpm'). This test
+        The default is MPM_MANIFEST_FILE_DEFAULT (typically '.mpm'). This test
         creates that file in a temp dir and changes cwd so the default path
         resolves correctly.
 
@@ -377,11 +377,11 @@ class TestRunDoctorHealthChecks:
         import os
 
         from mpm_cli.commands.doctor import run_doctor
-        from mpm_cli.constants import MPM_MPM_FILE_DEFAULT, MPM_MPM_FILE_ENV
+        from mpm_cli.constants import MPM_MANIFEST_FILE_DEFAULT, MPM_MANIFEST_FILE_ENV
 
-        monkeypatch.delenv(MPM_MPM_FILE_ENV, raising=False)
+        monkeypatch.delenv(MPM_MANIFEST_FILE_ENV, raising=False)
 
-        mpm_file = tmp_path / MPM_MPM_FILE_DEFAULT
+        mpm_file = tmp_path / MPM_MANIFEST_FILE_DEFAULT
         mpm_file.parent.mkdir(parents=True, exist_ok=True)
         mpm_file.write_text("MPM_MARKETPLACE_INSTALL=false\n", encoding="utf-8")
 

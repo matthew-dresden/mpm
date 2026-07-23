@@ -38,8 +38,8 @@ from packaging.version import InvalidVersion, Version
 from mpm_cli.constants import (
     CATALOG_TYPE_CLAUDE_MARKETPLACE,
     MPM_HEADER_CLAUDE_MARKETPLACES_DIR,
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     MPM_LOCK_FILE,
     MARKETPLACE_FLAG_TRUE,
     MISSING_CATALOG_ERROR_TEMPLATE,
@@ -169,12 +169,12 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     parser.add_argument(
         "--mpm-file",
         dest="mpm_file",
-        default=os.environ.get(MPM_MPM_FILE_ENV, MPM_MPM_FILE_DEFAULT),
+        default=os.environ.get(MPM_MANIFEST_FILE_ENV, MPM_MANIFEST_FILE_DEFAULT),
         metavar="<path>",
         help=(
             f"Destination .mpm file path. "
-            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
-            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            f"Defaults to '{MPM_MANIFEST_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MANIFEST_FILE_ENV} environment variable; "
             "the CLI flag takes precedence when both are set."
         ),
     )
@@ -1439,7 +1439,7 @@ def run_add(args: argparse.Namespace) -> int:
         )
         sys.exit(1)
 
-    mpm_file = pathlib.Path(getattr(args, "mpm_file", MPM_MPM_FILE_DEFAULT))
+    mpm_file = pathlib.Path(getattr(args, "mpm_file", MPM_MANIFEST_FILE_DEFAULT))
     guard_mpm_file_not_dir(mpm_file)
     force: bool = getattr(args, "force", False)
     dry_run: bool = getattr(args, "dry_run", False)

@@ -1,6 +1,6 @@
 """Integration tests for mpm __complete_source_names_in_mpm -- AC-TEST-002, AC-CYCLE-001.
 
-Builds a real .mpm fixture file with three sources, sets ${MPM_MPM_FILE}
+Builds a real .mpm fixture file with three sources, sets ${MPM_MANIFEST_FILE}
 to that path, invokes `mpm __complete_source_names_in_mpm` via subprocess,
 and asserts stdout is the sorted list of normalized names.
 """
@@ -30,7 +30,7 @@ def _run_complete(
 ) -> subprocess.CompletedProcess[str]:
     """Invoke `mpm __complete_source_names_in_mpm <current_token>` as subprocess."""
     env = {k: v for k, v in os.environ.items()}
-    env["MPM_MPM_FILE"] = str(mpm_path)
+    env["MPM_MANIFEST_FILE"] = str(mpm_path)
 
     env["MPM_HOME"] = str(cache_dir)
     env["MPM_COMPLETION_ENABLED"] = "1"

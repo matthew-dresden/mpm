@@ -1,3 +1,3 @@
 """mpm CLI -- Missing Package Manager."""
 
-__version__ = "3.3.0"
+__version__ = "0.1.0"

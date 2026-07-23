@@ -52,8 +52,9 @@ options:
                         sanitized manifest name, auto-suffixed
                         deterministically on a cross-source collision.
   --mpm-file <path>     Destination .mpm file path. Defaults to './.mpm'.
-                        Overridden by the MPM_MPM_FILE environment variable;
-                        the CLI flag takes precedence when both are set.
+                        Overridden by the MPM_MANIFEST_FILE environment
+                        variable; the CLI flag takes precedence when both are
+                        set.
   --force               Overwrite an existing alias block when re-adding the
                         same package (same source@ref), and re-pin its
                         .mpm.lock entry while keeping the dep's NAME. Without

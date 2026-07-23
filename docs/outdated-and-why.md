@@ -63,7 +63,7 @@ Steps:
 | `--no-color` | auto | Disable ANSI color. |
 
 Environment variable overrides: `--catalog-source` =
-`MPM_CATALOG_SOURCES`, `--mpm-file` = `MPM_MPM_FILE`,
+`MPM_CATALOG_SOURCES`, `--mpm-file` = `MPM_MANIFEST_FILE`,
 `--lock-file` = `MPM_LOCK_FILE`, `--format` =
 `MPM_OUTDATED_FORMAT`. See
 [docs/configuration.md](configuration.md) for details.
@@ -422,7 +422,7 @@ configurable via environment variables; see
 | `--no-color` | auto | Disable ANSI color. |
 
 Environment variable overrides: `--catalog-source` =
-`MPM_CATALOG_SOURCES`, `--mpm-file` = `MPM_MPM_FILE`,
+`MPM_CATALOG_SOURCES`, `--mpm-file` = `MPM_MANIFEST_FILE`,
 `--lock-file` = `MPM_LOCK_FILE`, `--format` = `MPM_WHY_FORMAT`.
 See [docs/configuration.md](configuration.md) for details.
 

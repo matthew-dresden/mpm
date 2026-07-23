@@ -15,7 +15,7 @@ file is NOT modified. Either every requested removal succeeds or
 nothing changes.
 
 The --mpm-file path defaults to './.mpm' and may be overridden by
-the MPM_MPM_FILE environment variable (CLI flag takes
+the MPM_MANIFEST_FILE environment variable (CLI flag takes
 precedence when both are set).
 
 File-writing rules (applied on non-dry-run writes):
@@ -35,8 +35,8 @@ positional arguments:
 options:
   -h, --help         show this help message and exit
   --mpm-file <path>  Path to the .mpm file to modify. Defaults to './.mpm'.
-                     Overridden by the MPM_MPM_FILE environment variable; the
-                     CLI flag takes precedence when both are set.
+                     Overridden by the MPM_MANIFEST_FILE environment variable;
+                     the CLI flag takes precedence when both are set.
   --force            Silently skip sources that are not fully present in the
                      .mpm file (used to clean up partially-orphaned entries).
                      Known sources are still removed atomically.

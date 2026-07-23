@@ -89,17 +89,17 @@ class TestExtractSourceNames:
 
 @pytest.mark.unit
 class TestResolveMPMFile:
-    """_resolve_mpm_file() returns a Path based on MPM_MPM_FILE env var."""
+    """_resolve_mpm_file() returns a Path based on MPM_MANIFEST_FILE env var."""
 
     def test_uses_env_var_when_set(self, tmp_path: Path) -> None:
-        """MPM_MPM_FILE env var is used when set."""
+        """MPM_MANIFEST_FILE env var is used when set."""
         custom = str(tmp_path / "custom.mpm")
-        with patch.dict(os.environ, {"MPM_MPM_FILE": custom}):
+        with patch.dict(os.environ, {"MPM_MANIFEST_FILE": custom}):
             assert _resolve_mpm_file() == Path(custom)
 
     def test_defaults_to_dot_mpm(self) -> None:
-        """When MPM_MPM_FILE is not set, defaults to ./.mpm."""
-        env_without = {k: v for k, v in os.environ.items() if k != "MPM_MPM_FILE"}
+        """When MPM_MANIFEST_FILE is not set, defaults to ./.mpm."""
+        env_without = {k: v for k, v in os.environ.items() if k != "MPM_MANIFEST_FILE"}
         with patch.dict(os.environ, env_without, clear=True):
             result = _resolve_mpm_file()
         assert result == Path("./.mpm")
@@ -117,7 +117,7 @@ class TestCompleteDisabled:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "0",
-                "MPM_MPM_FILE": str(mpm_path),
+                "MPM_MANIFEST_FILE": str(mpm_path),
             },
         ):
             result = complete("")
@@ -131,7 +131,7 @@ class TestCompleteDisabled:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "0",
-                "MPM_MPM_FILE": str(mpm_path),
+                "MPM_MANIFEST_FILE": str(mpm_path),
                 "MPM_COMPLETION_LOG": str(log_path),
                 "MPM_HOME": str(tmp_path),
             },
@@ -157,7 +157,7 @@ class TestCompleteHappyPath:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -177,7 +177,7 @@ class TestCompleteHappyPath:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -195,7 +195,7 @@ class TestCompleteHappyPath:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -227,7 +227,7 @@ class TestCompleteHappyPath:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -237,7 +237,7 @@ class TestCompleteHappyPath:
 
 @pytest.mark.unit
 class TestCompleteMissingFile:
-    """complete() returns empty and logs when MPM_MPM_FILE does not exist."""
+    """complete() returns empty and logs when MPM_MANIFEST_FILE does not exist."""
 
     def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
         """AC-FUNC-004: missing file -> empty stdout, exit 0 (no exception raised)."""
@@ -246,7 +246,7 @@ class TestCompleteMissingFile:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -261,7 +261,7 @@ class TestCompleteMissingFile:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_COMPLETION_LOG": str(log_path),
                 "MPM_HOME": str(tmp_path),
             },
@@ -286,7 +286,7 @@ class TestCompleteMalformedFile:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -302,7 +302,7 @@ class TestCompleteMalformedFile:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_COMPLETION_LOG": str(log_path),
                 "MPM_HOME": str(tmp_path),
             },
@@ -332,7 +332,7 @@ class TestHandle:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):
@@ -351,7 +351,7 @@ class TestHandle:
             os.environ,
             {
                 "MPM_COMPLETION_ENABLED": "1",
-                "MPM_MPM_FILE": str(mpm),
+                "MPM_MANIFEST_FILE": str(mpm),
                 "MPM_HOME": str(tmp_path),
             },
         ):

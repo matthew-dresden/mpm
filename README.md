@@ -478,7 +478,7 @@ mpm add my-tool --dry-run             # print the diff without writing
 
 Each entry is `<name>` or `<name>@<spec>` (PEP 440 constraint). Key options:
 `--as <alias>` (override the auto-computed alias), `--mpm-file <path>`
-(default `./.mpm`, env `MPM_MPM_FILE`), `--force` (overwrite an existing
+(default `./.mpm`, env `MPM_MANIFEST_FILE`), `--force` (overwrite an existing
 block), `--dry-run`, and the mutually-exclusive `--marketplace-install` /
 `--no-marketplace-install` (force the added dependency's marketplace flag,
 overriding the auto-detected `<catalog-metadata><type>`).

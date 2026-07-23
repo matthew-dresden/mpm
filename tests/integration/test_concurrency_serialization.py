@@ -376,7 +376,7 @@ class TestInstallPlusAddSerialization:
         """
         mpmenv = _write_mpmenv(tmp_path)
         env = _build_env()
-        env["MPM_MPM_FILE"] = str(mpmenv)
+        env["MPM_MANIFEST_FILE"] = str(mpmenv)
 
         results = _run_procs_wait(
             [_install_cmd(mpmenv), _add_cmd(mpmenv)],

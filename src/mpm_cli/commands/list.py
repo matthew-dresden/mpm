@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 
 from mpm_cli.constants import (
     BRANCH_SHA_TRUNCATION_LENGTH,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_ENV,
     MPM_LIST_COLUMN_REF,
     MPM_LIST_COLUMN_SOURCE,
     MPM_LIST_COLUMN_STATUS,
@@ -123,7 +123,7 @@ def _resolve_mpm_file(provided: pathlib.Path | None) -> pathlib.Path:
 
     Args:
         provided: Explicit ``.mpm`` path from ``--mpm-file`` / the
-            MPM_MPM_FILE env var, or None for auto-discovery.
+            MPM_MANIFEST_FILE env var, or None for auto-discovery.
 
     Returns:
         The resolved absolute path to the ``.mpm`` file.
@@ -434,12 +434,12 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     parser.add_argument(
         "--mpm-file",
         dest="mpm_file",
-        default=os.environ.get(MPM_MPM_FILE_ENV),
+        default=os.environ.get(MPM_MANIFEST_FILE_ENV),
         metavar="<path>",
         help=(
             "Path to the .mpm file. "
             "Defaults to auto-discovery (walk up from the current directory). "
-            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            f"Overridden by the {MPM_MANIFEST_FILE_ENV} environment variable; "
             "the CLI flag takes precedence when both are set."
         ),
     )

@@ -182,7 +182,7 @@ Used for completing the `<name>[@<spec>]` positional argument of
 **Shell helper:** `_mpm_complete_source_names_in_mpm`
 
 Retrieves source names defined in the `.mpm` file for the current
-project. Reads `${MPM_MPM_FILE:-./.mpm}` and emits one
+project. Reads `${MPM_MANIFEST_FILE:-./.mpm}` and emits one
 normalized source name per line (parsed from `MPM_SOURCE_<name>_URL`
 keys).
 
@@ -199,7 +199,7 @@ Retrieves names recorded in the lockfile. Resolves the lockfile path
 using the three-tier precedence chain:
 
 1. `${MPM_LOCK_FILE}` -- explicit lockfile path override.
-2. `${MPM_MPM_FILE}.lock` -- derived from the mpm file env var.
+2. `${MPM_MANIFEST_FILE}.lock` -- derived from the mpm file env var.
 3. `./.mpm.lock` -- default path in the current directory.
 
 Emits, one per line (sorted, deduplicated):

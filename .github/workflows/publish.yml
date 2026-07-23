@@ -1,13 +1,16 @@
 name: Publish to PyPI
 
-# DISABLED: requires PyPI credentials; see tracking issue.
-# on:
-#   workflow_dispatch:
-#     inputs:
-#       tag:
-#         description: "Tag to publish (e.g., 1.5.0)"
-#         required: true
-#         type: string
+# Publishes to PyPI via Trusted Publishing (OIDC) -- no API token is stored.
+# Authentication comes from the `pypi` GitHub environment plus the
+# `id-token: write` permission on the publish job, which PyPI verifies against
+# the Trusted Publisher registered for this project.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g., 1.5.0)"
+        required: true
+        type: string
 
 concurrency:
   group: publish-pipeline

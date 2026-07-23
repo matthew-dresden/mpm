@@ -38,8 +38,8 @@ import sys
 
 from mpm_cli.constants import (
     CATALOG_TYPE_CLAUDE_MARKETPLACE,
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     MARKETPLACE_FLAG_TRUE,
     SOURCE_MARKETPLACE_SUFFIX,
     SOURCE_PREFIX,
@@ -192,12 +192,12 @@ def _add_mpm_file_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mpm-file",
         dest="mpm_file",
-        default=os.environ.get(MPM_MPM_FILE_ENV, MPM_MPM_FILE_DEFAULT),
+        default=os.environ.get(MPM_MANIFEST_FILE_ENV, MPM_MANIFEST_FILE_DEFAULT),
         metavar="<path>",
         help=(
             f"Path to the .mpm file to read/modify. "
-            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
-            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            f"Defaults to '{MPM_MANIFEST_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MANIFEST_FILE_ENV} environment variable; "
             "the CLI flag takes precedence when both are set."
         ),
     )

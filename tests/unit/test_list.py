@@ -108,7 +108,7 @@ def _args(
 @pytest.fixture(autouse=True)
 def _clean_list_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure list-relevant env overrides do not leak into the in-process handler."""
-    for key in ("MPM_LOCK_FILE", "MPM_MPM_FILE", constants.MPM_LIST_OUTPUT_FORMAT):
+    for key in ("MPM_LOCK_FILE", "MPM_MANIFEST_FILE", constants.MPM_LIST_OUTPUT_FORMAT):
         monkeypatch.delenv(key, raising=False)
 
 

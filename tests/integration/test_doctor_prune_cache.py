@@ -67,14 +67,14 @@ def _base_env(cache_dir: pathlib.Path, mpm_file: pathlib.Path) -> dict[str, str]
     Args:
         cache_dir: The cache directory the subprocess must resolve to; its
             parent is set as MPM_HOME.
-        mpm_file: Path to set as MPM_MPM_FILE.
+        mpm_file: Path to set as MPM_MANIFEST_FILE.
 
     Returns:
-        Environment dict with PATH, MPM_HOME, MPM_MPM_FILE set.
+        Environment dict with PATH, MPM_HOME, MPM_MANIFEST_FILE set.
     """
     env = {k: v for k, v in os.environ.items()}
     env["MPM_HOME"] = str(cache_dir.parent)
-    env["MPM_MPM_FILE"] = str(mpm_file)
+    env["MPM_MANIFEST_FILE"] = str(mpm_file)
     return env
 
 

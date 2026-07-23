@@ -465,7 +465,7 @@ between two installs. See
 | `--catalog-source url[@ref]` | env | Catalog source; `@ref` optional. Env: MPM_CATALOG_SOURCES. |
 | `--catalog-default-branch name` | env | Branch used when the catalog source omits `@ref`. Env: MPM_CATALOG_DEFAULT_BRANCH (default `main`; `auto` = remote HEAD). |
 | `--as alias` | auto | Override the auto-computed local alias (single entry only). Charset `[A-Za-z0-9_]`, no `__` run. |
-| `--mpm-file path` | `./.mpm` | Target file. Env: MPM_MPM_FILE. |
+| `--mpm-file path` | `./.mpm` | Target file. Env: MPM_MANIFEST_FILE. |
 | `--force` | off | Re-add an existing alias (same source@ref): overwrite the block and re-pin its lock entry. Without it, a re-add is a hard error. |
 | `--dry-run` | off | Print diff without modifying any file. Exit 0. |
 | `--marketplace-install` | auto | Force `MPM_SOURCE_<alias>_MARKETPLACE=true` (errors if the entry is not a `claude-marketplace` type). Excl. `--no-marketplace-install`. |
@@ -726,7 +726,7 @@ preserved in its original order.
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `--mpm-file path` | `./.mpm` | Target file. Env: MPM_MPM_FILE. |
+| `--mpm-file path` | `./.mpm` | Target file. Env: MPM_MANIFEST_FILE. |
 | `--force` | off | Silently skip aliases not fully present (clean up partially-orphaned entries). Known aliases are still removed atomically. |
 | `--dry-run` | off | Print the lines that would be removed (each with a `-` prefix); makes no on-disk change. Exit 0. |
 
@@ -825,7 +825,7 @@ by `--limit` or `--no-limit`.
 Entry count above which `--tree` requires a filter. Default:
 `20`.
 
-**`MPM_MPM_FILE`** -- `add`, `remove`
+**`MPM_MANIFEST_FILE`** -- `add`, `remove`
 
 Default target file path. Default: `./.mpm`. Overridden by
 `--mpm-file`.

@@ -797,12 +797,12 @@ class TestAddSubcommandRegistration:
         import os
 
         parser = build_parser()
-        env_backup = os.environ.pop("MPM_MPM_FILE", None)
+        env_backup = os.environ.pop("MPM_MANIFEST_FILE", None)
         try:
             args = parser.parse_args(["add", "entry-a", "--catalog-source", "x@main"])
         finally:
             if env_backup is not None:
-                os.environ["MPM_MPM_FILE"] = env_backup
+                os.environ["MPM_MANIFEST_FILE"] = env_backup
         assert args.mpm_file == "./.mpm"
 
     def test_add_subcommand_sets_func(self) -> None:
@@ -820,7 +820,7 @@ class TestAddSubcommandRegistration:
         assert exc_info.value.code == 0
 
     def test_add_help_mentions_mpm_file_and_env_var(self) -> None:
-        """mpm add --help text mentions --mpm-file and MPM_MPM_FILE."""
+        """mpm add --help text mentions --mpm-file and MPM_MANIFEST_FILE."""
         import io
 
         parser = build_parser()
@@ -836,7 +836,7 @@ class TestAddSubcommandRegistration:
         add_parser.print_help(file=buf)
         help_text = buf.getvalue()
         assert "--mpm-file" in help_text
-        assert "MPM_MPM_FILE" in help_text
+        assert "MPM_MANIFEST_FILE" in help_text
 
 
 @pytest.mark.unit
@@ -869,7 +869,7 @@ class TestRemoveSubcommandRegistration:
 
     def test_remove_subcommand_mpm_file_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """--mpm-file defaults to ./.mpm when not supplied and env var is absent."""
-        monkeypatch.delenv("MPM_MPM_FILE", raising=False)
+        monkeypatch.delenv("MPM_MANIFEST_FILE", raising=False)
         parser = build_parser()
         args = parser.parse_args(["remove", "foo_bar"])
         assert args.mpm_file == "./.mpm"
@@ -907,7 +907,7 @@ class TestRemoveSubcommandRegistration:
         assert exc_info.value.code == 0
 
     def test_remove_help_mentions_mpm_file_and_env_var(self) -> None:
-        """mpm remove --help text mentions --mpm-file and MPM_MPM_FILE."""
+        """mpm remove --help text mentions --mpm-file and MPM_MANIFEST_FILE."""
         import io
 
         parser = build_parser()
@@ -923,7 +923,7 @@ class TestRemoveSubcommandRegistration:
         remove_parser.print_help(file=buf)
         help_text = buf.getvalue()
         assert "--mpm-file" in help_text
-        assert "MPM_MPM_FILE" in help_text
+        assert "MPM_MANIFEST_FILE" in help_text
 
     def test_remove_help_mentions_dual_input_contract(self) -> None:
         """mpm remove --help describes that both source name and entry name are accepted."""

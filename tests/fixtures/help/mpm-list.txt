@@ -26,8 +26,8 @@ options:
                       CLI flag takes precedence when both are set.
   --mpm-file <path>   Path to the .mpm file. Defaults to auto-discovery (walk
                       up from the current directory). Overridden by the
-                      MPM_MPM_FILE environment variable; the CLI flag takes
-                      precedence when both are set.
+                      MPM_MANIFEST_FILE environment variable; the CLI flag
+                      takes precedence when both are set.
   --lock-file <path>  Path to the .mpm.lock file. Defaults to <mpm-file>.lock.
                       Overridden by the MPM_LOCK_FILE environment variable;
                       the CLI flag takes precedence when both are set.

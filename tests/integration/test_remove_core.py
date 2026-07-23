@@ -311,7 +311,7 @@ class TestRemoveCoreErrorPaths:
         assert result.returncode == 0
         combined = result.stdout + result.stderr
         assert "--mpm-file" in combined
-        assert "MPM_MPM_FILE" in combined
+        assert "MPM_MANIFEST_FILE" in combined
 
 
 _MARKETPLACES_DIR_HEADER = "CLAUDE_MARKETPLACES_DIR=${HOME}/.claude-marketplaces"

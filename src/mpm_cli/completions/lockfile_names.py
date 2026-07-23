@@ -11,8 +11,8 @@ Resolution chain:
 1. If MPM_COMPLETION_ENABLED=0, return [] immediately (no file read).
 2. Resolve the lockfile path from the three-tier precedence chain:
    a. ${MPM_LOCK_FILE} environment variable.
-   b. ${MPM_MPM_FILE} + ".lock" (derived from the mpm file path).
-   c. ./.mpm.lock (default derived from MPM_MPM_FILE_DEFAULT).
+   b. ${MPM_MANIFEST_FILE} + ".lock" (derived from the mpm file path).
+   c. ./.mpm.lock (default derived from MPM_MANIFEST_FILE_DEFAULT).
 3. Read and parse the TOML lockfile via core.lockfile.read_lockfile().
 4. Enumerate all names:
    - Every top-level SourceEntry.name.
@@ -37,8 +37,8 @@ from pathlib import Path
 from mpm_cli.completions.cache import log_completion_error
 from mpm_cli.constants import (
     MPM_COMPLETION_ENABLED,
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     MPM_LOCK_FILE,
 )
 from mpm_cli.core.lockfile import (
@@ -123,7 +123,7 @@ def complete(current_token: str) -> list[str]:
         return []
 
     lock_path = derive_lock_file_path(
-        mpm_file_path=Path(os.environ.get(MPM_MPM_FILE_ENV, MPM_MPM_FILE_DEFAULT)),
+        mpm_file_path=Path(os.environ.get(MPM_MANIFEST_FILE_ENV, MPM_MANIFEST_FILE_DEFAULT)),
         cli_lock_file=None,
         env_lock_file=os.environ.get(MPM_LOCK_FILE),
     )

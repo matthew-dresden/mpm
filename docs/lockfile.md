@@ -919,7 +919,7 @@ bare version or branch name in all `mpm outdated` output columns.
 ## See also
 
 - [docs/configuration.md](configuration.md) -- all environment variables,
-  including `MPM_LOCK_FILE`, `MPM_MPM_FILE`, `MPM_HOME`, and
+  including `MPM_LOCK_FILE`, `MPM_MANIFEST_FILE`, `MPM_HOME`, and
   `MPM_CATALOG_SOURCES`.
 - [docs/architecture.md](architecture.md) -- install engine internals,
   lockfile-to-clone mapping, and the state machine that reads the

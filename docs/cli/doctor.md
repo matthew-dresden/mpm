@@ -28,7 +28,7 @@ emitted). Exit code is 1 when any error-level finding is detected.
 
 `--mpm-file <path>`
 : Path to the `.mpm` configuration file. Defaults to `./.mpm`. The
-  `MPM_MPM_FILE` environment variable is checked when this flag is not
+  `MPM_MANIFEST_FILE` environment variable is checked when this flag is not
   supplied; the CLI flag takes precedence when both are set.
 
 `--lock-file <path>`
@@ -434,7 +434,7 @@ are emitted. Health checks (subchecks 1-5, 6, 7, 9, 11) always run after.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MPM_MPM_FILE` | `./.mpm` | Path to the `.mpm` configuration file |
+| `MPM_MANIFEST_FILE` | `./.mpm` | Path to the `.mpm` configuration file |
 | `MPM_LOCK_FILE` | `<mpm-file>.lock` | Path to the `.mpm.lock` lockfile |
 | `MPM_CATALOG_SOURCES` | (none) | Newline-separated catalog sources as `<git-url>@<ref>`; the single configured entry is the effective value, overridden by the `--catalog-source` CLI flag |
 | `MPM_RESOLVE_TIMEOUT` | `30` | Timeout in seconds for each `git ls-remote` call |

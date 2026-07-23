@@ -52,8 +52,8 @@ from mpm_cli.constants import (
     MPM_DOCTOR_STALE_LOCK_AGE_HOURS,
     MPM_DOCTOR_STALE_LOCK_SCAN_MAX_DEPTH,
     MPM_HOME_CACHE_DIR_MODE,
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     MPM_LOCK_FILE,
     MPM_STALE_COMPLETION_SCRIPT_WARNING,
     MPM_STATIC_COMPLETION_SEARCH_PATHS,
@@ -1038,9 +1038,9 @@ def doctor_command(
         def now() -> datetime.datetime:
             return datetime.datetime.now(tz=datetime.timezone.utc)
 
-    mpm_file_str: str | None = getattr(args, "mpm_file", None) or os.environ.get(MPM_MPM_FILE_ENV)
+    mpm_file_str: str | None = getattr(args, "mpm_file", None) or os.environ.get(MPM_MANIFEST_FILE_ENV)
     if mpm_file_str is None:
-        mpm_file_str = MPM_MPM_FILE_DEFAULT
+        mpm_file_str = MPM_MANIFEST_FILE_DEFAULT
 
     lock_file_override: str | None = getattr(args, "lock_file", None) or os.environ.get(MPM_LOCK_FILE)
 
@@ -1213,7 +1213,7 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     """Register the 'doctor' subcommand on the top-level argparse subparsers.
 
     Adds the 'doctor' subparser with flags consumed by subchecks 1-5, 8, 10:
-    - ``--mpm-file``: path to .mpm (default MPM_MPM_FILE_DEFAULT).
+    - ``--mpm-file``: path to .mpm (default MPM_MANIFEST_FILE_DEFAULT).
     - ``--lock-file``: path to .mpm.lock (default derived from --mpm-file).
     - ``--strict-drift``: promote branch-drift findings to errors.
     - ``--no-color``: suppress ANSI color output.
@@ -1254,8 +1254,8 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         metavar="<path>",
         help=(
             f"Path to the .mpm file that identifies the workspace root. "
-            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
-            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            f"Defaults to '{MPM_MANIFEST_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MANIFEST_FILE_ENV} environment variable; "
             "the CLI flag takes precedence when both are set."
         ),
     )

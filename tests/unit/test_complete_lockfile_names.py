@@ -561,13 +561,13 @@ class TestCompleteLockfilePathResolution:
         assert result == ["mysource"]
 
     def test_derived_from_mpm_file_env(self, tmp_path: Path) -> None:
-        """When MPM_LOCK_FILE absent, derives path from MPM_MPM_FILE + .lock."""
+        """When MPM_LOCK_FILE absent, derives path from MPM_MANIFEST_FILE + .lock."""
         mpm_file = tmp_path / ".mpm"
         lock_path = tmp_path / ".mpm.lock"
         lockfile = _make_lockfile(sources=[_make_source("derived_source")])
         write_lockfile(lockfile, lock_path)
-        env = {k: v for k, v in os.environ.items() if k not in ("MPM_LOCK_FILE", "MPM_MPM_FILE")}
-        env["MPM_MPM_FILE"] = str(mpm_file)
+        env = {k: v for k, v in os.environ.items() if k not in ("MPM_LOCK_FILE", "MPM_MANIFEST_FILE")}
+        env["MPM_MANIFEST_FILE"] = str(mpm_file)
         env["MPM_COMPLETION_ENABLED"] = "1"
         env["MPM_HOME"] = str(tmp_path)
         with patch.dict(os.environ, env, clear=True):

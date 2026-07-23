@@ -657,7 +657,7 @@ class TestAddSubparser:
         add_parser.print_help(file=buf)
         help_text = buf.getvalue()
         assert "--mpm-file" in help_text
-        assert "MPM_MPM_FILE" in help_text
+        assert "MPM_MANIFEST_FILE" in help_text
 
     def test_add_help_mentions_spec_grammar(self, capsys: pytest.CaptureFixture[str]) -> None:
         """mpm add --help text references the @<spec> grammar."""

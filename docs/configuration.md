@@ -271,7 +271,7 @@ each `git ls-remote` call in `mpm install`, `mpm outdated`,
 `mpm why`, and `mpm doctor`. Bounded per call; not a global wall
 clock. Defined in `src/mpm_cli/constants.py`.
 
-**`MPM_MPM_FILE`** (default: `./.mpm`) -- Default `.mpm` file
+**`MPM_MANIFEST_FILE`** (default: `./.mpm`) -- Default `.mpm` file
 path. It supplies the default target for `mpm add` / `mpm remove`
 writes and the default `--mpm-file` value for the commands that accept
 that flag (`mpm add`, `mpm remove`, `mpm doctor`). On `mpm install`

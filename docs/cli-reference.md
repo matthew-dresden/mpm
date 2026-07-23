@@ -165,12 +165,12 @@ installed, under `--tree`).
 | `--tree` | Expand each installed source to its transitive packages (from the lock). |
 | `--status <installed\|not-installed\|orphan>` | Show only sources with the given status. |
 | `--format <table\|json>` | Output format (default `table`). `MPM_LIST_OUTPUT_FORMAT` sets the default; the flag wins. |
-| `--mpm-file <path>` | Path to `.mpm` (default: auto-discovery walking up from the cwd; `MPM_MPM_FILE` overrides). |
+| `--mpm-file <path>` | Path to `.mpm` (default: auto-discovery walking up from the cwd; `MPM_MANIFEST_FILE` overrides). |
 | `--lock-file <path>` | Path to `.mpm.lock` (default `<mpm-file>.lock`; `MPM_LOCK_FILE` overrides). |
 
 **Behaviour:**
 
-1. **`.mpm` required** -- resolved via `--mpm-file`, the `MPM_MPM_FILE`
+1. **`.mpm` required** -- resolved via `--mpm-file`, the `MPM_MANIFEST_FILE`
    env var, or auto-discovery. When none is found the command exits `1` with a
    clean `ERROR:` message.
 2. **Lockfile optional** -- when `.mpm.lock` is absent every declared source is
@@ -298,7 +298,7 @@ mpm outdated [--catalog-source <git-url>@<ref>]
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
 | `--catalog-source` | `MPM_CATALOG_SOURCES` | (none) | Manifest repo as `<git_url>@<ref>`. Required. |
-| `--mpm-file` | `MPM_MPM_FILE` | `./.mpm` | Path to the `.mpm` file. |
+| `--mpm-file` | `MPM_MANIFEST_FILE` | `./.mpm` | Path to the `.mpm` file. |
 | `--lock-file` | `MPM_LOCK_FILE` | `<mpm-file>.lock` | Path to the lockfile. Optional; derived from `--mpm-file` when absent. |
 | `--format` | `MPM_OUTDATED_FORMAT` | `table` | Output format: `table` (default) or `json`. The CLI flag takes precedence over the env var. |
 | `--fail-on-upgrade` | (none) | off | Exit 1 when any source has an available upgrade (`upgrade-type != none`). Default is always exit 0 -- parity with `pip list --outdated`, `npm outdated`, `cargo outdated` (spec Section 0.2). Use this flag in CI pipelines to gate on lockfile freshness. |
@@ -380,7 +380,7 @@ live-resolves the tree by walking the catalog (a catalog source is then required
 
 **Behaviour (spec Section 4.5):**
 
-1. Read the `.mpm` file at `--mpm-file` (default `./.mpm`; env `MPM_MPM_FILE`).
+1. Read the `.mpm` file at `--mpm-file` (default `./.mpm`; env `MPM_MANIFEST_FILE`).
 2. Resolve the full dependency tree:
    - If `.mpm.lock` exists (at `--lock-file` or its derived default), read the tree
      from the lockfile -- every node carries its resolved SHA. No `git ls-remote` calls.
@@ -461,7 +461,7 @@ live-resolves the tree by walking the catalog (a catalog source is then required
 |------|---------|---------|-------------|
 | `<project-url-or-name>` (positional) | -- | required | Project URL, XML manifest path, or source name to look up. |
 | `--catalog-source` | `MPM_CATALOG_SOURCES` | -- | Catalog source as `<git-url>@<ref>`. Required only when `.mpm.lock` is absent. |
-| `--mpm-file` | `MPM_MPM_FILE` | `./.mpm` | Path to the `.mpm` file. |
+| `--mpm-file` | `MPM_MANIFEST_FILE` | `./.mpm` | Path to the `.mpm` file. |
 | `--lock-file` | `MPM_LOCK_FILE` | `<mpm-file>.lock` | Path to the `.mpm.lock` file. |
 | `--format` | `MPM_WHY_FORMAT` | `text` | Output format: `text` (default) or `json`. See JSON shape below. |
 

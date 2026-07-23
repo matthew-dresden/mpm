@@ -38,8 +38,8 @@ import pathlib
 import sys
 
 from mpm_cli.constants import (
-    MPM_MPM_FILE_DEFAULT,
-    MPM_MPM_FILE_ENV,
+    MPM_MANIFEST_FILE_DEFAULT,
+    MPM_MANIFEST_FILE_ENV,
     SOURCE_PREFIX,
     SOURCE_RESERVED_SUFFIXES,
     SOURCE_SUFFIXES,
@@ -83,8 +83,8 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "the expected number of block keys), the command exits non-zero and the\n"
             "file is NOT modified. Either every requested removal succeeds or\n"
             "nothing changes.\n\n"
-            f"The --mpm-file path defaults to '{MPM_MPM_FILE_DEFAULT}' and may be overridden by\n"
-            f"the {MPM_MPM_FILE_ENV} environment variable (CLI flag takes\n"
+            f"The --mpm-file path defaults to '{MPM_MANIFEST_FILE_DEFAULT}' and may be overridden by\n"
+            f"the {MPM_MANIFEST_FILE_ENV} environment variable (CLI flag takes\n"
             "precedence when both are set).\n\n"
             "File-writing rules (applied on non-dry-run writes):\n"
             "  - Line-ending preservation: the dominant ending (LF or CRLF) in the\n"
@@ -111,12 +111,12 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     parser.add_argument(
         "--mpm-file",
         dest="mpm_file",
-        default=os.environ.get(MPM_MPM_FILE_ENV, MPM_MPM_FILE_DEFAULT),
+        default=os.environ.get(MPM_MANIFEST_FILE_ENV, MPM_MANIFEST_FILE_DEFAULT),
         metavar="<path>",
         help=(
             f"Path to the .mpm file to modify. "
-            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
-            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            f"Defaults to '{MPM_MANIFEST_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MANIFEST_FILE_ENV} environment variable; "
             "the CLI flag takes precedence when both are set."
         ),
     )
@@ -406,7 +406,7 @@ def run_remove(args: argparse.Namespace) -> int:
     Returns:
         0 on success; exits non-zero on any validation failure.
     """
-    mpm_file = pathlib.Path(getattr(args, "mpm_file", MPM_MPM_FILE_DEFAULT))
+    mpm_file = pathlib.Path(getattr(args, "mpm_file", MPM_MANIFEST_FILE_DEFAULT))
     guard_mpm_file_not_dir(mpm_file)
     dry_run: bool = getattr(args, "dry_run", False)
     force: bool = getattr(args, "force", False)
