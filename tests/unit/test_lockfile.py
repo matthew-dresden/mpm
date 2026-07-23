@@ -1,0 +1,1090 @@
+"""Unit tests for src/mpm_cli/core/lockfile.py -- schema validation rules (current: v5).
+
+Covers every validation rule parametrically per AC-TEST-001:
+  - resolved_sha shape (40 hex, 64 hex, uppercase rejected, mixed-case rejected, non-hex rejected)
+  - ref_spec accept set (PEP 440 SpecifierSet, refs/ prefix, branch-charset regex,
+    monorepo path prefix)
+  - canonical_url mismatch on ProjectEntry
+  - embedded NUL / newline / tab in path and path_in_repo
+  - unknown schema_version raises LockfileSchemaError
+  - schema v5 alias-keyed round-trip, absent [catalog] block, ref_spec rename
+  - v4 (and older) lock is a hard fail-fast regenerate (FLAG-C); no silent upgrade
+  - per-source content_pins round-trip, sorted by (name, path)
+  - per-source registered_marketplaces ledger (default empty, sorted round-trip, validation)
+  - dataclass construction and field access
+"""
+
+import pytest
+
+from mpm_cli.core.lockfile import (
+    CURRENT_SCHEMA_VERSION,
+    ContentPinEntry,
+    IncludeEntry,
+    Lockfile,
+    LockfileConsistencyError,
+    LockfileSchemaError,
+    LockfileValidationError,
+    ProjectEntry,
+    SourceEntry,
+    check_lockfile_consistency,
+    read_lockfile,
+    write_lockfile,
+)
+
+
+_VALID_SHA40 = "a" * 40
+_VALID_SHA64 = "b" * 64
+
+_VALID_MPM_HASH = "sha256:" + "a" * 64
+
+_VALID_PROJECT = ProjectEntry(
+    name="proj",
+    url="https://example.com/proj.git",
+    canonical_url="https://example.com/proj",
+    ref_spec="main",
+    resolved_ref="refs/heads/main",
+    resolved_sha=_VALID_SHA40,
+)
+
+_VALID_INCLUDE = IncludeEntry(
+    name="inc",
+    path_in_repo="repo-specs/inc.xml",
+    url="https://example.com/inc.git",
+    resolved_sha=_VALID_SHA40,
+    includes=[],
+)
+
+_VALID_SOURCE = SourceEntry(
+    alias="src",
+    name="src",
+    url="https://example.com/source.git",
+    ref_spec="main",
+    resolved_ref="refs/heads/main",
+    resolved_sha=_VALID_SHA40,
+    path="repo-specs/source.xml",
+    includes=[],
+    projects=[],
+)
+
+
+def _make_lockfile(**kwargs) -> Lockfile:
+    """Return a minimal valid Lockfile dataclass with optional field overrides."""
+    defaults = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "generator": "mpm-cli/2.0.0",
+        "mpm_hash": _VALID_MPM_HASH,
+        "sources": [],
+        "marketplace_registered": False,
+        "marketplace_dir": "",
+    }
+    defaults.update(kwargs)
+    return Lockfile(**defaults)
+
+
+def _make_source(**kwargs) -> SourceEntry:
+    """Return a valid SourceEntry with optional overrides."""
+    defaults = dict(
+        alias="src",
+        name="src",
+        url="https://example.com/source.git",
+        ref_spec="main",
+        resolved_ref="refs/heads/main",
+        resolved_sha=_VALID_SHA40,
+        path="repo-specs/source.xml",
+        includes=[],
+        projects=[],
+        registered_marketplaces=[],
+    )
+    defaults.update(kwargs)
+    return SourceEntry(**defaults)
+
+
+def _make_project(**kwargs) -> ProjectEntry:
+    """Return a valid ProjectEntry with optional overrides."""
+    defaults = dict(
+        name="proj",
+        url="https://example.com/proj.git",
+        canonical_url="https://example.com/proj",
+        ref_spec="main",
+        resolved_ref="refs/heads/main",
+        resolved_sha=_VALID_SHA40,
+    )
+    defaults.update(kwargs)
+    return ProjectEntry(**defaults)
+
+
+def _make_include(**kwargs) -> IncludeEntry:
+    """Return a valid IncludeEntry with optional overrides."""
+    defaults = dict(
+        name="inc",
+        path_in_repo="repo-specs/inc.xml",
+        url="https://example.com/inc.git",
+        resolved_sha=_VALID_SHA40,
+        includes=[],
+    )
+    defaults.update(kwargs)
+    return IncludeEntry(**defaults)
+
+
+def _minimal_toml(schema_version: int = CURRENT_SCHEMA_VERSION, **overrides) -> str:
+    """Return a minimal valid schema-v5 TOML string for use with read_lockfile.
+
+    Schema v5 has no [catalog] block; a single alias-keyed [[sources]] entry
+    carries the validated per-entry fields so the validation-rule tests have a
+    concrete target to mutate.  Content pins are optional, so the minimal lock
+    omits the [[sources.content_pins]] array entirely.
+    """
+    fields = {
+        "schema_version": schema_version,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "generator": "mpm-cli/2.0.0",
+        "mpm_hash": _VALID_MPM_HASH,
+    }
+    fields.update(overrides)
+    lines = [
+        f"schema_version = {fields['schema_version']}",
+        f'generated_at = "{fields["generated_at"]}"',
+        f'generator = "{fields["generator"]}"',
+        f'mpm_hash = "{fields["mpm_hash"]}"',
+        "marketplace_registered = false",
+        'marketplace_dir = ""',
+        "",
+        "[[sources]]",
+        'alias = "src"',
+        'name = "src"',
+        'url = "https://example.com/source.git"',
+        'ref_spec = "main"',
+        'resolved_ref = "refs/heads/main"',
+        f'resolved_sha = "{_VALID_SHA40}"',
+        'path = "repo-specs/source.xml"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.unit
+class TestDataclassConstruction:
+    """Verify the dataclass tree can be constructed with valid fields."""
+
+    def test_lockfile_construction(self):
+        lf = _make_lockfile()
+        assert lf.schema_version == CURRENT_SCHEMA_VERSION
+        assert lf.generated_at == "2026-01-01T00:00:00Z"
+        assert lf.generator == "mpm-cli/2.0.0"
+        assert lf.mpm_hash == _VALID_MPM_HASH
+        assert lf.sources == []
+        assert lf.marketplace_registered is False
+        assert lf.marketplace_dir == ""
+
+    def test_lockfile_has_no_catalog_field(self):
+        """Schema v4 removed the global [catalog] block; the Lockfile carries no catalog field."""
+        lf = _make_lockfile()
+        assert not hasattr(lf, "catalog"), "schema v4 removed the global [catalog] block"
+
+    def test_source_entry_construction(self):
+        se = _VALID_SOURCE
+        assert se.alias == "src"
+        assert se.name == "src"
+        assert se.url == "https://example.com/source.git"
+        assert se.ref_spec == "main"
+        assert se.path == "repo-specs/source.xml"
+        assert se.includes == []
+        assert se.projects == []
+
+    def test_include_entry_construction(self):
+        ie = _VALID_INCLUDE
+        assert ie.name == "inc"
+        assert ie.path_in_repo == "repo-specs/inc.xml"
+        assert ie.includes == []
+
+    def test_project_entry_construction(self):
+        pe = _VALID_PROJECT
+        assert pe.name == "proj"
+        assert pe.canonical_url == "https://example.com/proj"
+        assert pe.ref_spec == "main"
+
+    def test_nested_includes(self):
+        child = _make_include(name="child", includes=[])
+        parent = _make_include(name="parent", includes=[child])
+        assert parent.includes[0].name == "child"
+        assert parent.includes[0].includes == []
+
+
+@pytest.mark.unit
+class TestSchemaV5AliasKeyedSources:
+    """AC-19: CURRENT_SCHEMA_VERSION is 5 and the lock is alias-keyed with no [catalog] block."""
+
+    def test_current_schema_version_is_5(self):
+        """The schema version constant is 5 (FR-7 / FR-21 / FR-22)."""
+        assert CURRENT_SCHEMA_VERSION == 5
+
+    def test_source_serialised_with_alias_key_first(self, tmp_path):
+        """write_lockfile emits the alias key first in each [[sources]] entry."""
+        lf = _make_lockfile(sources=[_make_source(alias="my-alias", name="src")])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        text = p.read_text(encoding="utf-8")
+        source_block = text.split("[[sources]]", 1)[1]
+
+        first_key = next(line.strip() for line in source_block.splitlines() if line.strip())
+        assert first_key == 'alias = "my-alias"'
+
+    def test_alias_roundtrip(self, tmp_path):
+        """A custom alias survives a write/read roundtrip on the v4 lock."""
+        lf = _make_lockfile(sources=[_make_source(alias="custom-alias", name="src")])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        assert lf2.sources[0].alias == "custom-alias"
+        assert lf2.sources[0].name == "src"
+
+    def test_v4_per_entry_fields_present_on_disk(self, tmp_path):
+        """The serialised v4 source carries exactly the per-entry fields incl. ref_spec, no revision_spec."""
+        import tomllib
+
+        lf = _make_lockfile(sources=[_make_source(alias="a", name="src", ref_spec="==1.0.0")])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        entry = data["sources"][0]
+        assert entry["alias"] == "a"
+        assert entry["ref_spec"] == "==1.0.0"
+        assert "revision_spec" not in entry, "the v4 source key is ref_spec, not revision_spec"
+
+    def test_no_catalog_block_in_serialised_output(self, tmp_path):
+        """write_lockfile never emits a [catalog] block or a catalog table."""
+        import tomllib
+
+        lf = _make_lockfile(sources=[_make_source(alias="a", name="src")])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        text = p.read_text(encoding="utf-8")
+        assert "[catalog]" not in text
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        assert "catalog" not in data
+
+    def test_full_v4_roundtrip_equality(self, tmp_path):
+        """A populated v4 lock round-trips to an equal Lockfile object."""
+        lf = _make_lockfile(
+            sources=[
+                _make_source(
+                    alias="a",
+                    name="src",
+                    projects=[_make_project()],
+                    includes=[_make_include()],
+                )
+            ]
+        )
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        assert lf == lf2
+
+    def test_project_uses_ref_spec_on_disk(self, tmp_path):
+        """A serialised [[sources.projects]] entry carries ref_spec, not revision_spec."""
+        import tomllib
+
+        lf = _make_lockfile(sources=[_make_source(alias="a", name="src", projects=[_make_project(ref_spec="==2.0")])])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        proj = data["sources"][0]["projects"][0]
+        assert proj["ref_spec"] == "==2.0"
+        assert "revision_spec" not in proj
+
+
+@pytest.mark.unit
+class TestResolvedShaValidation:
+    """Parametrised tests for resolved_sha shape validation (AC-FUNC-002)."""
+
+    @pytest.mark.parametrize(
+        "sha",
+        [
+            "a" * 40,
+            "f" * 40,
+            "0" * 40,
+            "deadbeef" + "a" * 32,
+            "b" * 64,
+            "0" * 64,
+            "abcdef0123456789" * 4,
+        ],
+    )
+    def test_valid_resolved_sha_accepted(self, sha, tmp_path):
+        """Valid 40 or 64 lowercase hex shas are accepted by read_lockfile."""
+        toml_content = _minimal_toml()
+
+        toml_content = toml_content.replace(f'resolved_sha = "{_VALID_SHA40}"', f'resolved_sha = "{sha}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        lf = read_lockfile(p)
+        assert lf.sources[0].resolved_sha == sha
+
+    @pytest.mark.parametrize(
+        "bad_sha",
+        [
+            "A" * 40,
+            "F" * 40,
+            "DEADBEEF" + "a" * 32,
+            "g" * 40,
+            "z" * 40,
+            "a" * 39,
+            "a" * 41,
+            "a" * 63,
+            "a" * 65,
+            "",
+            "abc",
+        ],
+    )
+    def test_invalid_resolved_sha_raises(self, bad_sha, tmp_path):
+        """Invalid resolved_sha raises LockfileValidationError naming the bad value."""
+        toml_content = _minimal_toml()
+        toml_content = toml_content.replace(f'resolved_sha = "{_VALID_SHA40}"', f'resolved_sha = "{bad_sha}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        assert bad_sha in str(exc_info.value) or "resolved_sha" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "sha",
+        [
+            "DeadBeef" + "a" * 32,
+            "ABCDEF01" + "a" * 32,
+        ],
+    )
+    def test_mixed_case_sha_rejected(self, sha, tmp_path):
+        """Mixed-case resolved_sha is rejected (only lowercase hex accepted)."""
+        toml_content = _minimal_toml()
+        toml_content = toml_content.replace(f'resolved_sha = "{_VALID_SHA40}"', f'resolved_sha = "{sha}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        with pytest.raises(LockfileValidationError):
+            read_lockfile(p)
+
+    def test_error_message_names_field_path(self, tmp_path):
+        """LockfileValidationError message names the offending field path."""
+        bad_sha = "X" * 40
+        toml = _minimal_toml().replace(f'resolved_sha = "{_VALID_SHA40}"', f'resolved_sha = "{bad_sha}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+
+        assert "resolved_sha" in err_msg or bad_sha in err_msg
+
+
+@pytest.mark.unit
+class TestRefSpecValidation:
+    """Parametrised tests for ref_spec accept rules (AC-FUNC-003)."""
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "==1.0.0",
+            "~=2.0.0",
+            ">=1.0,<2.0",
+            "!=1.0.0",
+            "refs/heads/main",
+            "refs/tags/v1.0.0",
+            "refs/pull/42/head",
+            "main",
+            "feature-branch",
+            "release/1.0",
+            "my_branch",
+            "v1.0.0",
+            "feat/add-feature",
+            "subpackage/==1.0.0",
+            "sub/pkg/~=2.0.0",
+            "*",
+        ],
+    )
+    def test_valid_ref_spec_accepted(self, spec, tmp_path):
+        """Valid ref_spec values are accepted by read_lockfile."""
+        toml_content = _minimal_toml()
+        toml_content = toml_content.replace('ref_spec = "main"', f'ref_spec = "{spec}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        lf = read_lockfile(p)
+        assert lf.sources[0].ref_spec == spec
+
+    @pytest.mark.parametrize(
+        "bad_spec",
+        [
+            "has space",
+            "@invalid",
+            "!invalid",
+            "",
+        ],
+    )
+    def test_invalid_ref_spec_raises(self, bad_spec, tmp_path):
+        """Invalid ref_spec raises LockfileValidationError."""
+        toml_content = _minimal_toml()
+        toml_content = toml_content.replace('ref_spec = "main"', f'ref_spec = "{bad_spec}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        with pytest.raises(LockfileValidationError):
+            read_lockfile(p)
+
+    def test_monorepo_prefix_stripped_before_pep440_parse(self, tmp_path):
+        """Monorepo path prefix is stripped before PEP 440 parsing -- 'sub/==1.0.0' is valid."""
+        spec = "sub/==1.0.0"
+        toml_content = _minimal_toml()
+        toml_content = toml_content.replace('ref_spec = "main"', f'ref_spec = "{spec}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        lf = read_lockfile(p)
+        assert lf.sources[0].ref_spec == spec
+
+    def test_refs_prefix_accepted_verbatim(self, tmp_path):
+        """ref_spec starting with 'refs/' is accepted without further parsing."""
+        spec = "refs/heads/some-branch"
+        toml_content = _minimal_toml()
+        toml_content = toml_content.replace('ref_spec = "main"', f'ref_spec = "{spec}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        lf = read_lockfile(p)
+        assert lf.sources[0].ref_spec == spec
+
+
+@pytest.mark.unit
+class TestCanonicalUrlValidation:
+    """Tests for canonical_url mismatch detection (AC-FUNC-004)."""
+
+    def test_matching_canonical_url_accepted(self, tmp_path):
+        """ProjectEntry with canonical_url matching canonicalize_repo_url(url) is accepted."""
+        toml = (
+            _minimal_toml()
+            + "\n[[sources.projects]]\n"
+            + 'name = "proj"\n'
+            + 'url = "https://example.com/proj.git"\n'
+            + 'canonical_url = "https://example.com/proj"\n'
+            + 'ref_spec = "main"\n'
+            + 'resolved_ref = "refs/heads/main"\n'
+            + f'resolved_sha = "{_VALID_SHA40}"\n'
+        )
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        lf = read_lockfile(p)
+        assert lf.sources[0].projects[0].canonical_url == "https://example.com/proj"
+
+    def test_mismatched_canonical_url_raises(self, tmp_path):
+        """ProjectEntry with wrong canonical_url raises LockfileValidationError."""
+        toml = (
+            _minimal_toml()
+            + "\n[[sources.projects]]\n"
+            + 'name = "proj"\n'
+            + 'url = "https://example.com/proj.git"\n'
+            + 'canonical_url = "https://WRONG.example.com/proj"\n'
+            + 'ref_spec = "main"\n'
+            + 'resolved_ref = "refs/heads/main"\n'
+            + f'resolved_sha = "{_VALID_SHA40}"\n'
+        )
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+
+        assert "canonical_url" in err_msg or "WRONG" in err_msg
+
+    def test_error_includes_both_recorded_and_computed(self, tmp_path):
+        """canonical_url mismatch error shows both the recorded and computed values."""
+        wrong_canonical = "https://WRONG.example.com/proj"
+        toml = (
+            _minimal_toml()
+            + "\n[[sources.projects]]\n"
+            + 'name = "proj"\n'
+            + 'url = "https://example.com/proj.git"\n'
+            + f'canonical_url = "{wrong_canonical}"\n'
+            + 'ref_spec = "main"\n'
+            + 'resolved_ref = "refs/heads/main"\n'
+            + f'resolved_sha = "{_VALID_SHA40}"\n'
+        )
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+
+        assert wrong_canonical in err_msg
+
+        assert "https://example.com/proj" in err_msg
+
+
+@pytest.mark.unit
+class TestPathCharacterValidation:
+    """Tests for embedded NUL / newline / tab in path and path_in_repo (AC-FUNC-005)."""
+
+    @pytest.mark.parametrize(
+        ("field", "bad_char", "char_desc"),
+        [
+            ("path", "\x00", "NUL"),
+            ("path", "\n", "newline"),
+            ("path", "\t", "tab"),
+        ],
+    )
+    def test_bad_char_in_source_path_raises(self, field, bad_char, char_desc, tmp_path):
+        """SourceEntry.path containing NUL, newline, or tab raises LockfileValidationError."""
+        bad_path = f"repo-specs/some{bad_char}file.xml"
+
+        if bad_char == "\x00":
+            toml_path_val = bad_path.replace("\x00", "\\u0000")
+        elif bad_char == "\n":
+            toml_path_val = bad_path.replace("\n", "\\n")
+        elif bad_char == "\t":
+            toml_path_val = bad_path.replace("\t", "\\t")
+        else:
+            toml_path_val = bad_path
+        toml = _minimal_toml().replace('path = "repo-specs/source.xml"', f'path = "{toml_path_val}"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+        assert "path" in err_msg
+
+    @pytest.mark.parametrize(
+        ("bad_char", "char_desc"),
+        [
+            ("\x00", "NUL"),
+            ("\n", "newline"),
+            ("\t", "tab"),
+        ],
+    )
+    def test_bad_char_in_include_path_in_repo_raises(self, bad_char, char_desc, tmp_path):
+        """IncludeEntry.path_in_repo containing bad chars raises LockfileValidationError."""
+        if bad_char == "\x00":
+            toml_path_val = "repo-specs/inc\\u0000file.xml"
+        elif bad_char == "\n":
+            toml_path_val = "repo-specs/inc\\nfile.xml"
+        elif bad_char == "\t":
+            toml_path_val = "repo-specs/inc\\tfile.xml"
+        else:
+            toml_path_val = f"repo-specs/inc{bad_char}file.xml"
+        toml = (
+            _minimal_toml()
+            + "\n[[sources.includes]]\n"
+            + 'name = "inc"\n'
+            + f'path_in_repo = "{toml_path_val}"\n'
+            + 'url = "https://example.com/inc.git"\n'
+            + f'resolved_sha = "{_VALID_SHA40}"\n'
+        )
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+        assert "path_in_repo" in err_msg or "path" in err_msg
+
+    def test_error_names_bad_char_by_codepoint(self, tmp_path):
+        """LockfileValidationError names the bad character by codepoint."""
+        toml = _minimal_toml().replace('path = "repo-specs/source.xml"', 'path = "repo-specs/bad\\u0000file.xml"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        with pytest.raises(LockfileValidationError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+
+        assert any(x in err_msg for x in ["U+0000", "0x00", "NUL", "null", "\\x00"])
+
+    def test_clean_path_accepted(self, tmp_path):
+        """SourceEntry.path with no bad chars is accepted without error."""
+        toml = _minimal_toml().replace('path = "repo-specs/source.xml"', 'path = "repo-specs/clean-path.xml"')
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml)
+        lf = read_lockfile(p)
+        assert lf.sources[0].path == "repo-specs/clean-path.xml"
+
+
+@pytest.mark.unit
+class TestSchemaVersionValidation:
+    """Tests for schema_version handling -- updated for the v5 FLAG-C regenerate policy.
+
+    Forward-incompatible reads (schema_version > current) raise the upgrade-mpm-cli
+    error.  Any older schema (schema_version < current = 5) is a hard fail-fast
+    regenerate: schema v5 is the latest breaking major with no silent upgrader.
+    """
+
+    @pytest.mark.parametrize("future_version", [6, 99, 100])
+    def test_forward_incompatible_schema_raises_lockfile_schema_error(self, future_version, tmp_path):
+        """schema_version > CURRENT_SCHEMA_VERSION raises LockfileSchemaError."""
+        toml_content = _minimal_toml(schema_version=future_version)
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        with pytest.raises(LockfileSchemaError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+        assert f"v{future_version}" in err_msg
+        assert "upgrade mpm" in err_msg
+
+    @pytest.mark.parametrize("old_version", [1, 2, 3, 4])
+    def test_older_schema_hard_fails_regenerate(self, old_version, tmp_path):
+        """schema_version < CURRENT_SCHEMA_VERSION fails fast with the regenerate message (FLAG-C)."""
+        toml_content = _minimal_toml(schema_version=old_version)
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        with pytest.raises(LockfileSchemaError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+        assert f"v{old_version}" in err_msg
+        assert "mpm add" in err_msg
+        assert "mpm install" in err_msg
+
+    def test_schema_version_5_accepted(self, tmp_path):
+        """schema_version == 5 is the current supported version and is accepted."""
+        toml_content = _minimal_toml(schema_version=5)
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        lf = read_lockfile(p)
+        assert lf.schema_version == 5
+
+    def test_forward_incompat_schema_error_message_format(self, tmp_path):
+        """LockfileSchemaError message for forward-incompatible reads matches spec text."""
+        toml_content = _minimal_toml(schema_version=7)
+        p = tmp_path / "mpm.lock"
+        p.write_text(toml_content)
+        with pytest.raises(LockfileSchemaError) as exc_info:
+            read_lockfile(p)
+        assert str(exc_info.value) == "lockfile schema v7 written by newer mpm; upgrade mpm."
+
+    def test_schema_error_is_distinct_from_validation_error(self, tmp_path):
+        """LockfileSchemaError is NOT a subclass of LockfileValidationError."""
+        assert not issubclass(LockfileSchemaError, LockfileValidationError)
+
+    def test_both_exceptions_are_distinct_types(self):
+        """LockfileSchemaError and LockfileValidationError are distinct exception types."""
+        schema_err = LockfileSchemaError("schema v5 written by newer mpm; upgrade mpm.")
+        val_err = LockfileValidationError("bad sha")
+        assert type(schema_err) is not type(val_err)
+
+
+@pytest.mark.unit
+class TestV3HardFailRegenerate:
+    """A loaded v4-and-older lock fails fast with an actionable regenerate error.
+
+    v3 remains rejected; v4 is the new breaking boundary under schema v5.
+    """
+
+    def test_v3_lock_raises_schema_error_flag_c(self, tmp_path):
+        """A v3 lock raises LockfileSchemaError; there is no silent v3 -> v4 upgrader."""
+
+        v3_toml = (
+            "schema_version = 3\n"
+            'generated_at = "2026-01-01T00:00:00Z"\n'
+            'generator = "mpm-cli/1.4.0"\n'
+            f'mpm_hash = "{_VALID_MPM_HASH}"\n'
+            "marketplace_registered = false\n"
+            'marketplace_dir = ""\n'
+            "\n"
+            "[catalog]\n"
+            'source = "https://example.com/catalog.git@main"\n'
+            'url = "https://example.com/catalog.git"\n'
+            'revision_spec = "main"\n'
+            'resolved_ref = "refs/heads/main"\n'
+            f'resolved_sha = "{_VALID_SHA40}"\n'
+            "\n"
+            "[[sources]]\n"
+            'name = "src"\n'
+            'url = "https://example.com/source.git"\n'
+            'revision_spec = "main"\n'
+            'resolved_ref = "refs/heads/main"\n'
+            f'resolved_sha = "{_VALID_SHA40}"\n'
+            'path = "repo-specs/source.xml"\n'
+            "registered_marketplaces = []\n"
+        )
+        p = tmp_path / "mpm.lock"
+        p.write_text(v3_toml)
+        with pytest.raises(LockfileSchemaError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+        assert "v3" in err_msg
+        assert "ref_spec" in err_msg or "alias" in err_msg
+        assert "mpm add" in err_msg and "mpm install" in err_msg
+
+    def test_v3_schema_error_not_silent(self, tmp_path):
+        """The v3 read raises (does not silently succeed by upgrading)."""
+        v3_toml = _minimal_toml(schema_version=3)
+        p = tmp_path / "mpm.lock"
+        p.write_text(v3_toml)
+
+        with pytest.raises(LockfileSchemaError):
+            read_lockfile(p)
+
+    def test_v4_lock_raises_schema_error_regenerate(self, tmp_path):
+        """A v4 lock is the new breaking boundary: it fails fast with the regenerate error.
+
+        Schema v5 adds per-source content-SHA pins on top of v4; a v4 lock carries no
+        pins and there is no silent v4 -> v5 upgrader, so read_lockfile must reject it
+        with the actionable regenerate message that names schema v5.
+        """
+        v4_toml = _minimal_toml(schema_version=4)
+        p = tmp_path / "mpm.lock"
+        p.write_text(v4_toml)
+        with pytest.raises(LockfileSchemaError) as exc_info:
+            read_lockfile(p)
+        err_msg = str(exc_info.value)
+        assert "v4" in err_msg
+        assert "schema v5" in err_msg
+        assert "regenerate the lockfile" in err_msg
+        assert "mpm add" in err_msg and "mpm install" in err_msg
+
+
+@pytest.mark.unit
+class TestReadLockfileMissingFile:
+    """read_lockfile raises an informative error when the file does not exist."""
+
+    def test_missing_file_raises_file_not_found(self, tmp_path):
+        """read_lockfile raises FileNotFoundError for a nonexistent path."""
+        p = tmp_path / "nonexistent.lock"
+        with pytest.raises(FileNotFoundError):
+            read_lockfile(p)
+
+
+@pytest.mark.unit
+class TestWriteLockfileUnit:
+    """Basic unit tests for write_lockfile -- atomicity is tested in integration."""
+
+    def test_write_creates_file(self, tmp_path):
+        """write_lockfile creates the destination file."""
+        lf = _make_lockfile()
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        assert p.exists()
+
+    def test_write_creates_valid_toml(self, tmp_path):
+        """write_lockfile produces a file parseable by tomllib."""
+        import tomllib
+
+        lf = _make_lockfile()
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        assert data["schema_version"] == CURRENT_SCHEMA_VERSION
+
+    def test_write_then_read_roundtrip(self, tmp_path):
+        """write_lockfile followed by read_lockfile round-trips the Lockfile object."""
+        lf = _make_lockfile()
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        assert lf == lf2
+
+
+@pytest.mark.unit
+class TestMarketplaceFields:
+    """AC-7: Lockfile marketplace_registered and marketplace_dir fields (retained in v4)."""
+
+    def test_marketplace_registered_defaults_false(self):
+        """Lockfile.marketplace_registered defaults to False when not supplied."""
+        lf = _make_lockfile()
+        assert lf.marketplace_registered is False
+
+    def test_marketplace_dir_defaults_empty_string(self):
+        """Lockfile.marketplace_dir defaults to empty string when not supplied."""
+        lf = _make_lockfile()
+        assert lf.marketplace_dir == ""
+
+    def test_marketplace_registered_true_roundtrip(self, tmp_path):
+        """marketplace_registered=True and marketplace_dir are preserved by write/read roundtrip."""
+        lf = _make_lockfile(marketplace_registered=True, marketplace_dir="/path/to/mp")
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        assert lf2.marketplace_registered is True
+        assert lf2.marketplace_dir == "/path/to/mp"
+
+    def test_marketplace_registered_false_roundtrip(self, tmp_path):
+        """marketplace_registered=False roundtrips correctly."""
+        lf = _make_lockfile(marketplace_registered=False, marketplace_dir="")
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        assert lf2.marketplace_registered is False
+        assert lf2.marketplace_dir == ""
+
+    def test_marketplace_dir_written_to_toml(self, tmp_path):
+        """write_lockfile writes marketplace_dir to the TOML file."""
+        import tomllib
+
+        lf = _make_lockfile(marketplace_registered=True, marketplace_dir="/home/user/.claude/marketplaces")
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        assert data["marketplace_registered"] is True
+        assert data["marketplace_dir"] == "/home/user/.claude/marketplaces"
+
+    def test_marketplace_registered_written_to_toml_as_false(self, tmp_path):
+        """write_lockfile writes marketplace_registered=false to the TOML file when not registered."""
+        import tomllib
+
+        lf = _make_lockfile(marketplace_registered=False)
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        assert data["marketplace_registered"] is False
+
+
+def _source_toml_block(*, name: str, registered_marketplaces_literal: str | None) -> str:
+    """Return an alias-keyed v4 ``[[sources]]`` TOML block, optionally with the ledger.
+
+    Args:
+        name: The source name (also used as the alias).
+        registered_marketplaces_literal: If not None, the raw TOML array literal
+            to emit for ``registered_marketplaces`` (e.g. ``'["a-mp"]'`` or
+            ``"[1, 2, 3]"``).  When None the key is omitted entirely (default ledger).
+    """
+    lines = [
+        "",
+        "[[sources]]",
+        f'alias = "{name}"',
+        f'name = "{name}"',
+        'url = "https://example.com/source.git"',
+        'ref_spec = "main"',
+        'resolved_ref = "refs/heads/main"',
+        f'resolved_sha = "{_VALID_SHA40}"',
+        'path = "repo-specs/source.xml"',
+    ]
+    if registered_marketplaces_literal is not None:
+        lines.append(f"registered_marketplaces = {registered_marketplaces_literal}")
+    return "\n".join(lines) + "\n"
+
+
+def _bare_v5_header() -> str:
+    """Return the top-level scalar fields of a v5 lock with no sources appended yet."""
+    return (
+        "schema_version = 5\n"
+        'generated_at = "2026-01-01T00:00:00Z"\n'
+        'generator = "mpm-cli/2.0.0"\n'
+        f'mpm_hash = "{_VALID_MPM_HASH}"\n'
+        "marketplace_registered = false\n"
+        'marketplace_dir = ""\n'
+    )
+
+
+@pytest.mark.unit
+class TestRegisteredMarketplacesField:
+    """Lockfile PER-SOURCE ``registered_marketplaces`` ledger field (schema v3, retained in v4)."""
+
+    def test_source_registered_marketplaces_defaults_empty(self):
+        """SourceEntry.registered_marketplaces defaults to an empty list when not supplied."""
+        src = SourceEntry(
+            alias="src",
+            name="src",
+            url="https://example.com/source.git",
+            ref_spec="main",
+            resolved_ref="refs/heads/main",
+            resolved_sha=_VALID_SHA40,
+            path="repo-specs/source.xml",
+        )
+        assert src.registered_marketplaces == []
+
+    def test_lockfile_has_no_top_level_registered_marketplaces(self):
+        """The root Lockfile dataclass carries NO top-level registered_marketplaces field."""
+        lf = _make_lockfile()
+        assert not hasattr(lf, "registered_marketplaces"), (
+            "the ledger is per-source; the root Lockfile must not expose it"
+        )
+
+    def test_source_registered_marketplaces_written_empty_as_toml_array(self, tmp_path):
+        """write_lockfile emits registered_marketplaces = [] inside the source table when empty."""
+        import tomllib
+
+        lf = _make_lockfile(sources=[_make_source(alias="src", name="src", registered_marketplaces=[])])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        assert "registered_marketplaces" not in data, "the ledger must not appear at the top level"
+        assert data["sources"][0]["registered_marketplaces"] == []
+
+    def test_source_registered_marketplaces_roundtrip_sorted(self, tmp_path):
+        """write_lockfile sorts each source's ledger; read_lockfile returns the sorted list."""
+        lf = _make_lockfile(sources=[_make_source(alias="src", name="src", registered_marketplaces=["b-mp", "a-mp"])])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        assert lf2.sources[0].registered_marketplaces == ["a-mp", "b-mp"]
+
+    def test_per_source_ledgers_are_independent(self, tmp_path):
+        """Two sources keep distinct per-source ledgers across a write/read roundtrip."""
+        lf = _make_lockfile(
+            sources=[
+                _make_source(alias="alpha", name="alpha", registered_marketplaces=["alpha-mp"]),
+                _make_source(alias="bravo", name="bravo", registered_marketplaces=["bravo-mp"]),
+            ]
+        )
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        lf2 = read_lockfile(p)
+        by_name = {s.name: s for s in lf2.sources}
+        assert by_name["alpha"].registered_marketplaces == ["alpha-mp"]
+        assert by_name["bravo"].registered_marketplaces == ["bravo-mp"]
+
+    def test_source_registered_marketplaces_written_sorted_in_toml(self, tmp_path):
+        """write_lockfile serialises each source's ledger sorted regardless of input order."""
+        import tomllib
+
+        lf = _make_lockfile(
+            sources=[_make_source(alias="src", name="src", registered_marketplaces=["b-mp", "a-mp", "c-mp"])]
+        )
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        assert data["sources"][0]["registered_marketplaces"] == ["a-mp", "b-mp", "c-mp"]
+
+    def test_source_registered_marketplaces_rewrite_is_byte_stable(self, tmp_path):
+        """Re-writing a lockfile read from disk produces byte-identical output."""
+        lf = _make_lockfile(sources=[_make_source(alias="src", name="src", registered_marketplaces=["b-mp", "a-mp"])])
+        p1 = tmp_path / "mpm.lock"
+        write_lockfile(lf, p1)
+        first_bytes = p1.read_bytes()
+
+        lf2 = read_lockfile(p1)
+        p2 = tmp_path / "mpm2.lock"
+        write_lockfile(lf2, p2)
+        second_bytes = p2.read_bytes()
+        assert first_bytes == second_bytes
+
+    def test_v5_source_without_ledger_key_defaults_to_empty(self, tmp_path):
+        """A v5 source TOML lacking registered_marketplaces defaults to a per-source empty ledger."""
+        v5_toml = _bare_v5_header() + _source_toml_block(name="legacy", registered_marketplaces_literal=None)
+        p = tmp_path / "mpm.lock"
+        p.write_text(v5_toml)
+        lf = read_lockfile(p)
+        assert lf.schema_version == 5
+        assert len(lf.sources) == 1
+        assert lf.sources[0].registered_marketplaces == [], "a missing registered_marketplaces key must default to []"
+
+    def test_non_list_source_registered_marketplaces_raises_validation_error(self, tmp_path):
+        """A per-source registered_marketplaces that is not a list of strings raises a validation error."""
+        bad_toml = _bare_v5_header() + _source_toml_block(name="src", registered_marketplaces_literal="[1, 2, 3]")
+        p = tmp_path / "mpm.lock"
+        p.write_text(bad_toml)
+        with pytest.raises(LockfileValidationError, match=r"sources\[0\].registered_marketplaces"):
+            read_lockfile(p)
+
+
+@pytest.mark.unit
+class TestContentPinsRoundTrip:
+    """Schema v5 per-source content_pins serialise, parse back, and sort by (name, path)."""
+
+    def test_content_pins_roundtrip_sorted_by_name_then_path(self, tmp_path):
+        """write_lockfile then read_lockfile preserves pins, emitting them sorted by (name, path)."""
+        sha_a = "a" * 40
+        sha_b = "b" * 40
+        sha_c = "c" * 40
+        unsorted_pins = [
+            ContentPinEntry(name="zeta", path="services/zeta", resolved_sha=sha_c),
+            ContentPinEntry(name="alpha", path="services/beta", resolved_sha=sha_b),
+            ContentPinEntry(name="alpha", path="services/alpha", resolved_sha=sha_a),
+        ]
+        lf = _make_lockfile(sources=[_make_source(alias="src", name="src", content_pins=unsorted_pins)])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+
+        text = p.read_text(encoding="utf-8")
+        pin_names = [
+            line.split("=", 1)[1].strip().strip('"') for line in text.splitlines() if line.startswith("name = ")
+        ]
+        ordered_pin_names = pin_names[-3:]
+        assert ordered_pin_names == ["alpha", "alpha", "zeta"], "pins must serialise sorted by (name, path)"
+
+        lf2 = read_lockfile(p)
+        round_tripped = lf2.sources[0].content_pins
+        assert [(pin.name, pin.path, pin.resolved_sha) for pin in round_tripped] == [
+            ("alpha", "services/alpha", sha_a),
+            ("alpha", "services/beta", sha_b),
+            ("zeta", "services/zeta", sha_c),
+        ]
+
+    def test_content_pins_default_empty_and_absent_array_parses(self, tmp_path):
+        """A v5 source with no content_pins serialises no [[sources.content_pins]] and parses to []."""
+        lf = _make_lockfile(sources=[_make_source(alias="src", name="src")])
+        p = tmp_path / "mpm.lock"
+        write_lockfile(lf, p)
+        assert "[[sources.content_pins]]" not in p.read_text(encoding="utf-8")
+        lf2 = read_lockfile(p)
+        assert lf2.sources[0].content_pins == []
+
+
+@pytest.mark.unit
+class TestCheckLockfileConsistency:
+    """The shared .mpm <-> .mpm.lock consistency check (alias uniqueness, alias-set, ref-specs)."""
+
+    def test_consistent_pair_passes(self) -> None:
+        """A .mpm and lock with the same alias set and ref-specs raises nothing."""
+        lockfile = _make_lockfile(
+            sources=[
+                _make_source(alias="alpha", ref_spec="main"),
+                _make_source(alias="beta", ref_spec="==1.2.3"),
+            ],
+        )
+        mpm_aliases = ["alpha", "beta"]
+        mpm_ref_specs = {"alpha": "main", "beta": "==1.2.3"}
+
+        assert check_lockfile_consistency(mpm_aliases, mpm_ref_specs, lockfile) is None
+
+    def test_duplicate_alias_raises(self) -> None:
+        """A duplicate alias in the .mpm declarations raises naming the alias."""
+        lockfile = _make_lockfile(sources=[_make_source(alias="alpha", ref_spec="main")])
+        mpm_aliases = ["alpha", "alpha"]
+        mpm_ref_specs = {"alpha": "main"}
+
+        with pytest.raises(LockfileConsistencyError, match=r"duplicate source alias in \.mpm: alpha"):
+            check_lockfile_consistency(mpm_aliases, mpm_ref_specs, lockfile)
+
+    def test_alias_added_in_mpm_but_missing_from_lock_raises(self) -> None:
+        """An alias declared in .mpm but absent from the lock raises naming it as missing."""
+        lockfile = _make_lockfile(sources=[_make_source(alias="alpha", ref_spec="main")])
+        mpm_aliases = ["alpha", "beta"]
+        mpm_ref_specs = {"alpha": "main", "beta": "main"}
+
+        with pytest.raises(LockfileConsistencyError) as exc_info:
+            check_lockfile_consistency(mpm_aliases, mpm_ref_specs, lockfile)
+        message = str(exc_info.value)
+        assert "alias sets differ" in message
+        assert "missing from .mpm.lock: beta" in message
+
+    def test_alias_orphaned_in_lock_but_absent_from_mpm_raises(self) -> None:
+        """An alias present in the lock but not declared in .mpm raises naming it as orphaned."""
+        lockfile = _make_lockfile(
+            sources=[
+                _make_source(alias="alpha", ref_spec="main"),
+                _make_source(alias="gamma", ref_spec="main"),
+            ],
+        )
+        mpm_aliases = ["alpha"]
+        mpm_ref_specs = {"alpha": "main"}
+
+        with pytest.raises(LockfileConsistencyError) as exc_info:
+            check_lockfile_consistency(mpm_aliases, mpm_ref_specs, lockfile)
+        message = str(exc_info.value)
+        assert "alias sets differ" in message
+        assert "not declared in .mpm: gamma" in message
+
+    def test_ref_spec_drift_raises(self) -> None:
+        """A per-alias ref-spec that differs between .mpm and the lock raises naming the alias."""
+        lockfile = _make_lockfile(sources=[_make_source(alias="alpha", ref_spec="main")])
+        mpm_aliases = ["alpha"]
+        mpm_ref_specs = {"alpha": "==2.0.0"}
+
+        with pytest.raises(LockfileConsistencyError) as exc_info:
+            check_lockfile_consistency(mpm_aliases, mpm_ref_specs, lockfile)
+        message = str(exc_info.value)
+        assert "ref-specs differ" in message
+        assert "alpha" in message
+        assert "==2.0.0" in message
+        assert "main" in message
+
+    def test_empty_pair_passes(self) -> None:
+        """A .mpm with no sources and an empty lock is consistent (no aliases either side)."""
+        lockfile = _make_lockfile(sources=[])
+        assert check_lockfile_consistency([], {}, lockfile) is None

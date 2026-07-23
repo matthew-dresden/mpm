@@ -1,0 +1,1605 @@
+"""mpm why subcommand: explain why a project is in the resolved dependency tree.
+
+Reads the .mpm file, resolves the full dependency tree (from .mpm.lock when
+present; otherwise live-resolves against the catalog), locates all chains ending
+at the requested node, and prints one chain per line.
+
+Chain format (text mode):
+  <top-source> -> <include-path>@<sha> -> ... -> <project>@<sha>
+
+Argument matching:
+  All categories are evaluated before deciding. No early-exit on first hit. Matched
+  nodes are grouped by logical identity, so the same logical node reached by many
+  chains (e.g. a transitive include pulled in by many sources) resolves to one
+  identity and every chain is printed.
+  (a) <project> repo URL -- canonicalized via canonicalize_repo_url. Match against
+      every <project> node's canonicalized URL.
+  (b) Transitive XML manifest path -- exact-string equality against every <include>
+      node's path_in_repo (ref) value.
+  (c) Top-level source name -- normalized via derive_source_name so that case and
+      dash/underscore differences are treated as equivalent.
+  (d) Transitive include name -- normalized via derive_source_name, matched against
+      every <include> node's name.
+
+Ambiguity:
+  Only when two or more DISTINCT logical interpretations match is a hard error
+  raised, naming each distinct interpretation so the operator can disambiguate.
+
+Spec reference: spec/mpm-list-add-lock-features-spec.md Section 4.5
+behaviour steps 1-3, 5 (text format). Section 7 for MPM_WHY_FORMAT.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+
+import defusedxml.ElementTree as ET
+
+from mpm_cli.repo.subcmds.envsubst import _UNRESOLVED_PATTERN
+from mpm_cli.constants import (
+    MPM_ALLOW_INSECURE_REMOTES,
+    MPM_MPM_FILE_DEFAULT,
+    MPM_MPM_FILE_ENV,
+    MPM_LOCK_FILE,
+    MPM_WHY_FORMAT,
+    MPM_WHY_FORMAT_DEFAULT,
+    MPM_WHY_FORMAT_JSON,
+    MPM_WHY_JSON_INDENT,
+    MPM_WHY_SUGGEST_MAX_DISTANCE,
+    MPM_WHY_SUGGEST_TOP_N,
+    MISSING_CATALOG_ERROR_TEMPLATE,
+    WHY_SCOPE_TOP_LEVEL,
+    WHY_SCOPE_TRANSITIVE,
+)
+from mpm_cli.utils.levenshtein import levenshtein_distance
+from mpm_cli.core.catalog import resolve_env_catalog_source
+from mpm_cli.core.cli_args import add_catalog_source_arg
+from mpm_cli.core.include_walker import IncludeTree, _walk_includes
+from mpm_cli.core.install import _resolve_ref_to_sha
+from mpm_cli.core.mpmenv import parse_mpmenv
+from mpm_cli.core.lockfile import Lockfile, IncludeEntry, read_lockfile
+from mpm_cli.core.manifest import join_project_repo_url, walk_includes_collecting_remotes
+from mpm_cli.core.metadata import derive_source_name
+from mpm_cli.core.remote_url import _enforce_remote_url_policy
+from mpm_cli.core.url import canonicalize_repo_url
+from mpm_cli.utils.lock_file_path import derive_lock_file_path
+
+
+@dataclass
+class ChainNode:
+    """A single node in a resolved dependency chain.
+
+    Attributes:
+        kind: One of 'source', 'include', or 'project'.
+        name: Human-readable name of the node.
+        ref: For 'include' nodes, the path_in_repo value (e.g. 'repo-specs/bar.xml').
+            For 'source' and 'project' nodes this is None.
+        sha: The resolved git commit SHA for this node.
+        url: The repository URL for 'source' and 'project' nodes. None for 'include' nodes.
+        canonical_url: The canonicalized URL for 'project' nodes (used for URL matching).
+            None for 'source' and 'include' nodes.
+        scope: Scope tag for the node. For nodes built from the lockfile, source nodes
+            carry WHY_SCOPE_TOP_LEVEL and include nodes carry WHY_SCOPE_TRANSITIVE.
+            None for nodes built via live-resolve or for project nodes.
+        children: Direct child nodes (populated when building the tree from the lockfile).
+    """
+
+    kind: str
+    name: str
+    ref: str | None
+    sha: str
+    url: str | None
+    canonical_url: str | None = None
+    scope: str | None = None
+    children: list[ChainNode] = field(default_factory=list)
+
+
+@dataclass
+class ResolvedTree:
+    """The complete resolved dependency tree.
+
+    Attributes:
+        sources: One ChainNode per top-level MPM_SOURCE_* entry.
+            Each source's children are include nodes and project nodes.
+    """
+
+    sources: list[ChainNode]
+
+
+def _include_entry_to_node(entry: IncludeEntry) -> ChainNode:
+    """Convert a lockfile IncludeEntry to a ChainNode (recursively).
+
+    Each include node is tagged with WHY_SCOPE_TRANSITIVE to distinguish it
+    from top-level source nodes (tagged WHY_SCOPE_TOP_LEVEL) when walking
+    chains from a named node.
+
+    Args:
+        entry: A lockfile IncludeEntry dataclass instance.
+
+    Returns:
+        A ChainNode of kind 'include' with nested child nodes.
+    """
+    node = ChainNode(
+        kind="include",
+        name=entry.name,
+        ref=entry.path_in_repo,
+        sha=entry.resolved_sha,
+        url=None,
+        scope=WHY_SCOPE_TRANSITIVE,
+    )
+    for child_include in entry.includes:
+        node.children.append(_include_entry_to_node(child_include))
+    return node
+
+
+def _collect_leaf_include_nodes(include_nodes: list[ChainNode]) -> list[ChainNode]:
+    """Collect the leaf include nodes (those with no nested include children).
+
+    A leaf include node is an include node that has no include-kind children.
+    Project nodes added as children are ignored when checking for leaf status --
+    this function is called before projects are attached.
+
+    Args:
+        include_nodes: The include ChainNode instances to search recursively.
+
+    Returns:
+        A flat list of leaf include ChainNode objects in DFS pre-order.
+    """
+    leaves: list[ChainNode] = []
+    for node in include_nodes:
+        nested_includes = [c for c in node.children if c.kind == "include"]
+        if not nested_includes:
+            leaves.append(node)
+        else:
+            leaves.extend(_collect_leaf_include_nodes(nested_includes))
+    return leaves
+
+
+def _build_tree_from_lockfile(lockfile: Lockfile) -> ResolvedTree:
+    """Build a ResolvedTree from a parsed Lockfile dataclass.
+
+    The tree mirrors the lockfile structure:
+      - One ChainNode(kind='source') per [[sources]] entry.
+      - Each source's children: ChainNode(kind='include') nodes (recursive).
+      - Project nodes are placed under the leaf include nodes (the deepest
+        include in each branch). When a source has no includes, projects are
+        placed directly under the source.
+
+    The lockfile v1 schema stores projects flat under the source rather than
+    under their declaring include. To reconstruct include-node segments in
+    chain output (e.g. ``FOO -> repo-specs/bar.xml@<sha> -> baz@<sha>``),
+    this function places all source-level projects under every leaf include
+    node (match by include position). When no includes are present the
+    projects remain direct children of the source node.
+
+    Args:
+        lockfile: A fully parsed Lockfile dataclass instance.
+
+    Returns:
+        A ResolvedTree with one source node per lockfile source entry.
+    """
+    sources: list[ChainNode] = []
+
+    for source_entry in lockfile.sources:
+        source_node = ChainNode(
+            kind="source",
+            name=source_entry.name,
+            ref=None,
+            sha=source_entry.resolved_sha,
+            url=source_entry.url,
+            scope=WHY_SCOPE_TOP_LEVEL,
+        )
+
+        include_chain_roots: list[ChainNode] = []
+        for inc in source_entry.includes:
+            include_chain_roots.append(_include_entry_to_node(inc))
+
+        project_nodes: list[ChainNode] = [
+            ChainNode(
+                kind="project",
+                name=proj.name,
+                ref=None,
+                sha=proj.resolved_sha,
+                url=proj.url,
+                canonical_url=proj.canonical_url,
+            )
+            for proj in source_entry.projects
+        ]
+
+        if include_chain_roots:
+            for inc_node in include_chain_roots:
+                source_node.children.append(inc_node)
+
+            leaf_includes = _collect_leaf_include_nodes(include_chain_roots)
+            for leaf in leaf_includes:
+                for proj_node in project_nodes:
+                    leaf.children.append(
+                        ChainNode(
+                            kind="project",
+                            name=proj_node.name,
+                            ref=proj_node.ref,
+                            sha=proj_node.sha,
+                            url=proj_node.url,
+                            canonical_url=proj_node.canonical_url,
+                        )
+                    )
+        else:
+            for proj_node in project_nodes:
+                source_node.children.append(proj_node)
+
+        sources.append(source_node)
+
+    return ResolvedTree(sources=sources)
+
+
+class LiveResolveError(Exception):
+    """Raised when the live-resolve catalog walk fails for a named source.
+
+    Attributes:
+        name: The source or project name that could not be resolved.
+        reason: A human-readable explanation of the failure (one line).
+    """
+
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = name
+        self.reason = reason
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        return (
+            f"ERROR: cannot resolve '{self.name}' via catalog walk: {self.reason}\n"
+            "Remediation: Verify --catalog-source URL + revision are reachable "
+            "and the catalog manifest is well-formed."
+        )
+
+
+def _include_tree_to_chain_nodes(
+    include_tree: IncludeTree,
+    source_sha: str,
+    source_url: str,
+) -> list[ChainNode]:
+    """Convert an ``IncludeTree`` to a flat list of include ``ChainNode`` roots.
+
+    Each node in the tree becomes an ``include`` ChainNode. Children are attached
+    recursively so the resulting nodes mirror the ``_build_tree_from_lockfile``
+    structure.  The ``sha`` of each include node is set to ``source_sha`` because
+    the live-resolve path does not have per-include commit SHAs (those require a
+    full ``repo sync``).
+
+    Only the direct children of the root ``IncludeTree`` node are returned (the
+    root itself represents the manifest XML entry point, not an include).
+
+    Args:
+        include_tree: Root ``IncludeTree`` from ``_walk_includes``.
+        source_sha: The resolved SHA of the owning source, used as a
+            placeholder SHA for all include nodes on the live-resolve path.
+        source_url: The URL of the source repo, stored on each include node.
+
+    Returns:
+        A list of ``ChainNode(kind='include')`` objects representing the
+        direct include children of the manifest root, with nested children
+        attached recursively.
+    """
+
+    def _convert(node: IncludeTree) -> ChainNode:
+        inc_node = ChainNode(
+            kind="include",
+            name=str(node.path),
+            ref=str(node.path),
+            sha=source_sha,
+            url=None,
+        )
+        for child in node.includes:
+            inc_node.children.append(_convert(child))
+        return inc_node
+
+    return [_convert(child) for child in include_tree.includes]
+
+
+def _substitute_fetch_url(
+    fetch_url: str,
+    globals_map: dict[str, str],
+    source_name: str,
+    mpm_file: pathlib.Path,
+) -> str:
+    """Substitute ``${VAR}`` placeholders in a remote ``fetch`` URL.
+
+    Applies the ``.mpm`` globals to any ``${VAR}`` placeholder in
+    ``fetch_url`` using ``os.path.expandvars`` -- the same primitive
+    ``repo envsubst`` / ``envsubst.py::resolve_variable`` uses.  Variables are
+    set into a copy of the process environment for the duration of the call and
+    then immediately restored, so the substitution does not mutate the global
+    process state.
+
+    If any ``${VAR}`` placeholder survives after substitution (i.e. the
+    variable was not declared in the ``.mpm`` globals), the function
+    raises ``LiveResolveError`` with an actionable message naming the missing
+    variable and the ``.mpm`` file path.
+
+    A ``fetch_url`` with no ``${...}`` patterns is returned unchanged without
+    touching ``os.environ``.
+
+    Args:
+        fetch_url: The raw remote ``fetch`` attribute value from the manifest
+            XML (may contain ``${VAR}`` placeholders).
+        globals_map: The ``.mpm`` globals dict from ``parse_mpmenv``
+            (``mpmenv["globals"]``).
+        source_name: The MPM_SOURCE name, used in error messages.
+        mpm_file: Path to the ``.mpm`` file, used in error messages.
+
+    Returns:
+        The ``fetch_url`` with all ``${VAR}`` placeholders replaced by their
+        values from ``globals_map``.
+
+    Raises:
+        LiveResolveError: If a ``${VAR}`` placeholder has no matching global
+            in ``globals_map``, naming the missing variable and ``.mpm`` path.
+    """
+    if "${" not in fetch_url:
+        return fetch_url
+
+    overwritten: dict[str, str | None] = {}
+    for key, value in globals_map.items():
+        overwritten[key] = os.environ.get(key)
+        os.environ[key] = value
+
+    try:
+        substituted = os.path.expandvars(fetch_url)
+    finally:
+        for key, original in overwritten.items():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
+
+    unresolved = _UNRESOLVED_PATTERN.findall(substituted)
+    if unresolved:
+        missing_var = unresolved[0]
+        raise LiveResolveError(
+            source_name,
+            f"remote fetch URL {fetch_url!r} references ${{{missing_var}}} "
+            f"but {missing_var!r} is not declared in {mpm_file}. "
+            f"Add {missing_var}=<value> to {mpm_file} or use a concrete fetch URL.",
+        )
+
+    return substituted
+
+
+def _build_project_nodes_from_xml(
+    manifest_xml_path: pathlib.Path,
+    manifest_repo: pathlib.Path,
+    source_sha: str,
+    source_name: str,
+    globals_map: dict[str, str] | None = None,
+    mpm_file: pathlib.Path | None = None,
+) -> list[ChainNode]:
+    """Parse ``<project>`` elements from a manifest XML and return project ``ChainNode`` objects.
+
+    Resolves the project URL by looking up each project's ``remote`` attribute
+    in the remote-name -> fetch-URL mapping collected by
+    ``walk_includes_collecting_remotes``.  Remote ``fetch`` values that contain
+    ``${VAR}`` placeholders are substituted from ``globals_map`` via
+    ``_substitute_fetch_url`` before canonicalization.  Only ``<project>``
+    elements whose remote resolves to a concrete, canonicalizable fetch URL are
+    included; remotes with no entry in the remote map are skipped (they produce
+    R001 audit findings -- a separate validation concern).
+
+    The ``sha`` of each project node is set to ``source_sha`` because the
+    live-resolve path does not run ``repo sync`` and therefore has no
+    per-project commit SHAs.
+
+    Args:
+        manifest_xml_path: Absolute path to the root manifest XML file.
+        manifest_repo: Absolute path to the root of the manifest repository.
+        source_sha: The resolved SHA of the owning source, used as a
+            placeholder SHA for all project nodes on the live-resolve path.
+        source_name: The MPM_SOURCE_<name> key, used for error context.
+        globals_map: The ``.mpm`` globals dict from ``parse_mpmenv``
+            (``mpmenv["globals"]``).  When supplied, ``${VAR}`` placeholders
+            in remote ``fetch`` URLs are resolved from this map.  Omit (or pass
+            ``None``) to skip placeholder substitution (legacy / non-live-resolve
+            callers).
+        mpm_file: Path to the ``.mpm`` file, forwarded to
+            ``_substitute_fetch_url`` for actionable error messages.  Required
+            when ``globals_map`` is supplied.
+
+    Returns:
+        A list of ``ChainNode(kind='project')`` objects, one per resolvable
+        ``<project>`` element found in the manifest and its reachable includes.
+
+    Raises:
+        LiveResolveError: If the manifest XML cannot be parsed, or if a
+            ``${VAR}`` placeholder in a remote ``fetch`` has no matching global.
+    """
+    resolved_globals: dict[str, str] = globals_map if globals_map is not None else {}
+    resolved_mpm_file: pathlib.Path = mpm_file if mpm_file is not None else pathlib.Path(".mpm")
+
+    try:
+        remote_map = walk_includes_collecting_remotes(manifest_xml_path, manifest_repo)
+        tree = ET.parse(str(manifest_xml_path))
+        root = tree.getroot()
+    except Exception as exc:
+        raise LiveResolveError(
+            source_name,
+            f"failed to parse manifest XML at {manifest_xml_path}: {exc}",
+        ) from exc
+
+    if root is None:
+        return []
+
+    project_nodes: list[ChainNode] = []
+    for project_el in root.iter("project"):
+        remote_attr = project_el.get("remote")
+        project_name = project_el.get("name", "")
+        if not remote_attr or not project_name:
+            continue
+
+        raw_fetch = remote_map.get(remote_attr)
+        if raw_fetch is None:
+            continue
+
+        fetch_url = _substitute_fetch_url(
+            raw_fetch,
+            resolved_globals,
+            source_name,
+            resolved_mpm_file,
+        )
+
+        raw_url = join_project_repo_url(fetch_url, project_name)
+        try:
+            canonical = canonicalize_repo_url(raw_url)
+        except ValueError:
+            continue
+
+        project_nodes.append(
+            ChainNode(
+                kind="project",
+                name=project_name,
+                ref=None,
+                sha=source_sha,
+                url=raw_url,
+                canonical_url=canonical,
+            )
+        )
+
+    return project_nodes
+
+
+def _clone_source_repo(
+    url: str,
+    revision: str,
+    source_name: str,
+    dest: pathlib.Path,
+) -> None:
+    """Clone a source repo at a specific revision into ``dest``.
+
+    Uses ``git clone --depth 1 --branch <revision>`` with the last path
+    component of ``revision`` stripped of the ``refs/tags/`` or
+    ``refs/heads/`` prefix so that git receives a plain branch-or-tag name.
+
+    Args:
+        url: The git remote URL of the source repo.
+        revision: The revision spec string from the .mpm file (e.g.
+            ``"refs/tags/1.0.0"`` or ``"main"``).
+        source_name: The source name, used only in ``LiveResolveError`` messages.
+        dest: The directory to clone into.
+
+    Raises:
+        LiveResolveError: If ``git clone`` exits non-zero.
+    """
+
+    branch_or_tag = revision
+    for prefix in ("refs/tags/", "refs/heads/"):
+        if revision.startswith(prefix):
+            branch_or_tag = revision[len(prefix) :]
+            break
+
+    result = subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", branch_or_tag, url, str(dest)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise LiveResolveError(
+            source_name,
+            f"git clone failed for {url}@{revision}: {result.stderr.strip()}",
+        )
+
+
+def _populate_source_children_from_manifest(
+    source_node: ChainNode,
+    source_url: str,
+    revision: str,
+    manifest_path: str,
+    source_sha: str,
+    source_name: str,
+    tmp_base: pathlib.Path,
+    globals_map: dict[str, str] | None = None,
+    mpm_file: pathlib.Path | None = None,
+) -> None:
+    """Clone the source repo and attach include/project children to ``source_node``.
+
+    Clones the source repo at the stored revision, walks the manifest XML at
+    ``manifest_path`` for ``<include>`` chains and ``<project>`` elements, and
+    appends the resulting ``ChainNode`` children to ``source_node``.
+
+    This mirrors the lockfile-path child-building logic in
+    ``_build_tree_from_lockfile`` (~215-240) so that ``_match_by_url`` and
+    ``_match_by_xml_path`` find real nodes in the live-resolve tree.
+
+    Args:
+        source_node: The ``ChainNode(kind='source')`` to attach children to.
+        source_url: The git URL of the source (manifest) repo.
+        revision: The revision spec from the .mpm file.
+        manifest_path: Repo-relative path to the manifest XML (e.g.
+            ``"repo-specs/foo-marketplace.xml"``).
+        source_sha: The resolved SHA of this source, used as placeholder SHA
+            for include and project nodes on the live-resolve path.
+        source_name: The MPM_SOURCE_<name> key, used in error messages.
+        tmp_base: A temporary directory path under which the clone is placed.
+        globals_map: The ``.mpm`` globals dict from ``parse_mpmenv``
+            (``mpmenv["globals"]``).  Forwarded to ``_build_project_nodes_from_xml``
+            so that ``${VAR}`` placeholders in remote ``fetch`` URLs are
+            resolved.  Pass ``None`` to skip placeholder substitution.
+        mpm_file: Path to the ``.mpm`` file forwarded for error messages.
+
+    Raises:
+        LiveResolveError: If cloning fails or if the manifest XML cannot be
+            parsed, or if a ``${VAR}`` placeholder has no matching global.
+    """
+    clone_dest = tmp_base / source_name
+    _clone_source_repo(
+        url=source_url,
+        revision=revision,
+        source_name=source_name,
+        dest=clone_dest,
+    )
+
+    manifest_xml_path = clone_dest / manifest_path
+    if not manifest_xml_path.exists():
+        raise LiveResolveError(
+            source_name,
+            f"manifest XML not found in cloned repo at path {manifest_path!r}. "
+            "Verify MPM_SOURCE_{name}_PATH is correct.",
+        )
+
+    try:
+        include_tree = _walk_includes(manifest_xml_path, clone_dest)
+    except Exception as exc:
+        raise LiveResolveError(
+            source_name,
+            f"failed to walk <include> chain in {manifest_path}: {exc}",
+        ) from exc
+
+    include_roots = _include_tree_to_chain_nodes(include_tree, source_sha, source_url)
+    project_nodes = _build_project_nodes_from_xml(
+        manifest_xml_path,
+        clone_dest,
+        source_sha,
+        source_name,
+        globals_map=globals_map,
+        mpm_file=mpm_file,
+    )
+
+    if include_roots:
+        for inc_node in include_roots:
+            source_node.children.append(inc_node)
+        leaf_includes = _collect_leaf_include_nodes(include_roots)
+        for leaf in leaf_includes:
+            for proj_node in project_nodes:
+                leaf.children.append(
+                    ChainNode(
+                        kind="project",
+                        name=proj_node.name,
+                        ref=proj_node.ref,
+                        sha=proj_node.sha,
+                        url=proj_node.url,
+                        canonical_url=proj_node.canonical_url,
+                    )
+                )
+    else:
+        for proj_node in project_nodes:
+            source_node.children.append(proj_node)
+
+
+def _live_resolve_tree(mpm_file: pathlib.Path, catalog_source: str) -> ResolvedTree:
+    """Resolve the dependency tree live from the .mpm file.
+
+    This path is used when no .mpm.lock is present. Requires a catalog source
+    to satisfy the caller's precondition check; the actual source resolution
+    reads URLs and revisions directly from the parsed .mpm file entries.
+
+    For each MPM_SOURCE_<name> entry in the .mpm file:
+      - Enforces the remote URL security policy.
+      - Resolves the declared revision to a concrete commit SHA via git ls-remote.
+      - Builds a ChainNode(kind='source') for the source.
+      - Clones the source repo and walks its manifest XML to populate the
+        source node's project and include children, mirroring the tree
+        structure built by _build_tree_from_lockfile (~215-240) for the
+        lockfile path. This makes _match_by_url and _match_by_xml_path
+        traverse real nodes on the live-resolve path.
+
+    Args:
+        mpm_file: Path to the .mpm configuration file.
+        catalog_source: The catalog source string in '<git-url>@<ref>' format.
+            Not used for resolution -- included as a parameter to preserve the
+            caller's precondition API (catalog source required on live path).
+
+    Returns:
+        A ResolvedTree with one source ChainNode per .mpm source entry,
+        each with its include and project children populated.
+
+    Raises:
+        LiveResolveError: If ref-to-SHA resolution fails for any source entry,
+            if the remote URL policy rejects a source URL, if git clone fails,
+            or if the manifest XML cannot be parsed.
+        ValueError: From parse_mpmenv when the .mpm file is malformed or
+            missing required source variables.
+    """
+    if not catalog_source:
+        raise ValueError(
+            "catalog_source must be a non-empty '<git-url>@<ref>' string; "
+            "received an empty value. "
+            "The caller must verify --catalog-source is present before invoking _live_resolve_tree."
+        )
+    allow_insecure: bool = os.environ.get(MPM_ALLOW_INSECURE_REMOTES) == "1"
+    mpmenv = parse_mpmenv(mpm_file)
+    globals_map: dict[str, str] = mpmenv.get("globals", {})
+    source_nodes: list[ChainNode] = []
+
+    with tempfile.TemporaryDirectory(prefix="mpm-why-live-") as _tmp_dir:
+        tmp_base = pathlib.Path(_tmp_dir)
+
+        for source_name in mpmenv["MPM_SOURCES"]:
+            source_data = mpmenv["sources"][source_name]
+            url: str = source_data["url"]
+            revision: str = source_data["ref"]
+            manifest_path: str = source_data["path"]
+
+            try:
+                _enforce_remote_url_policy(
+                    url=url,
+                    allow_insecure=allow_insecure,
+                    remote_name=source_name,
+                    source_path=source_name,
+                )
+            except Exception as exc:
+                raise LiveResolveError(source_name, str(exc)) from exc
+
+            try:
+                ref_resolution = _resolve_ref_to_sha(url, revision)
+            except ValueError as exc:
+                raise LiveResolveError(source_name, str(exc)) from exc
+
+            source_node = ChainNode(
+                kind="source",
+                name=source_name,
+                ref=manifest_path,
+                sha=ref_resolution.sha,
+                url=url,
+            )
+
+            _populate_source_children_from_manifest(
+                source_node=source_node,
+                source_url=url,
+                revision=revision,
+                manifest_path=manifest_path,
+                source_sha=ref_resolution.sha,
+                source_name=source_name,
+                tmp_base=tmp_base,
+                globals_map=globals_map,
+                mpm_file=mpm_file,
+            )
+
+            source_nodes.append(source_node)
+
+    return ResolvedTree(sources=source_nodes)
+
+
+def _walk_chains(tree: ResolvedTree, target_canonical_url: str) -> list[list[ChainNode]]:
+    """Walk the resolved tree depth-first and collect all chains ending at the target.
+
+    A chain is a list of ChainNode objects from a top-level source node down to
+    the target project node (inclusive).
+
+    Args:
+        tree: The fully resolved dependency tree.
+        target_canonical_url: The canonical URL of the project node to find.
+
+    Returns:
+        A list of chains. Each chain is a list of ChainNode objects.
+        Returns an empty list when no chain reaches the target.
+    """
+    found_chains: list[list[ChainNode]] = []
+
+    def _dfs(node: ChainNode, path: list[ChainNode]) -> None:
+        current_path = path + [node]
+
+        if node.kind == "project" and node.canonical_url == target_canonical_url:
+            found_chains.append(current_path)
+            return
+
+        for child in node.children:
+            _dfs(child, current_path)
+
+    for source_node in tree.sources:
+        _dfs(source_node, [])
+
+    return found_chains
+
+
+def _walk_chains_from_node(tree: ResolvedTree, target_node: ChainNode) -> list[list[ChainNode]]:
+    """Walk the resolved tree DFS and collect all chains passing through the target node.
+
+    Used when the argument matched an include or source node (not a project URL).
+
+    Scope-aware chain construction:
+      - When target_node carries WHY_SCOPE_TOP_LEVEL (a lockfile top-level source),
+        return a single-node chain containing just that source. The source is the
+        terminal point of interest; callers requested the source by name and the
+        single-node chain correctly represents "this source is installed directly".
+      - When target_node carries WHY_SCOPE_TRANSITIVE (a lockfile transitive include),
+        walk all descendant chains from the include node down to leaf project nodes,
+        prefixed by the path from the tree root to the include (existing behaviour).
+      - When target_node.scope is None (live-resolve source or project node), fall
+        back to the original leaf-collection behaviour: descend all children or
+        return the node itself when it has no children.
+
+    Args:
+        tree: The fully resolved dependency tree.
+        target_node: The ChainNode (source or include kind) to find and report chains for.
+
+    Returns:
+        A list of chains. Each chain is a list of ChainNode objects starting from
+        a top-level source down through target_node and its descendants.
+        When target_node carries WHY_SCOPE_TOP_LEVEL, returns a single-element list
+        containing the single-node chain [target_node].
+        When target_node carries WHY_SCOPE_TRANSITIVE, returns all chains passing
+        through it down to leaf project nodes.
+        Returns an empty list when no chains pass through the target node.
+    """
+    found_chains: list[list[ChainNode]] = []
+
+    def _dfs_collect_all_leaves(node: ChainNode, path: list[ChainNode]) -> None:
+        """Collect all chains from the current node to every leaf descendant.
+
+        A leaf is either:
+          - A 'project' node (always a leaf regardless of children), or
+          - Any node with no children (source or include with no nested entries).
+        """
+        current_path = path + [node]
+        if node.kind == "project":
+            found_chains.append(current_path)
+            return
+        if not node.children:
+            found_chains.append(current_path)
+            return
+        for child in node.children:
+            _dfs_collect_all_leaves(child, current_path)
+
+    def _dfs_find(node: ChainNode, path: list[ChainNode]) -> None:
+        """Walk the tree looking for target_node; once found, collect chains."""
+        if node is target_node:
+            if node.scope == WHY_SCOPE_TOP_LEVEL:
+                found_chains.append([node])
+                return
+
+            _dfs_collect_all_leaves(node, path)
+            return
+        for child in node.children:
+            _dfs_find(child, path + [node])
+
+    for source_node in tree.sources:
+        _dfs_find(source_node, [])
+
+    return found_chains
+
+
+def _match_by_url(tree: ResolvedTree, argument: str) -> list[ChainNode]:
+    """Match the argument against project and source nodes by canonicalized URL.
+
+    Attempts to canonicalize the argument. If canonicalization fails (argument is
+    not a valid URL), returns an empty list -- no match in this category.
+
+    Matches:
+    - ``project`` nodes: ``node.canonical_url == canonicalize_repo_url(argument)``.
+    - ``source`` nodes: ``canonicalize_repo_url(node.url) == target_canonical``
+      when the source carries a URL (live-resolve path sets ``source.url`` to the
+      git remote URL of the manifest repo).
+
+    Args:
+        tree: The fully resolved dependency tree.
+        argument: The raw argument string from the CLI.
+
+    Returns:
+        List of ChainNode objects (project or source) whose canonical URL equals
+        ``canonicalize_repo_url(argument)``.  Empty when no match or when
+        canonicalization raises ValueError.
+    """
+    try:
+        target_canonical = canonicalize_repo_url(argument)
+    except ValueError:
+        return []
+
+    matches: list[ChainNode] = []
+
+    for source_node in tree.sources:
+        if source_node.url is not None:
+            try:
+                source_canonical = canonicalize_repo_url(source_node.url)
+            except ValueError:
+                source_canonical = None
+            if source_canonical == target_canonical:
+                matches.append(source_node)
+
+    def _collect_projects(node: ChainNode) -> None:
+        if node.kind == "project" and node.canonical_url == target_canonical:
+            matches.append(node)
+        for child in node.children:
+            _collect_projects(child)
+
+    for source_node in tree.sources:
+        _collect_projects(source_node)
+
+    return matches
+
+
+def _match_by_xml_path(tree: ResolvedTree, argument: str) -> list[ChainNode]:
+    """Match the argument against include and source nodes by XML path equality.
+
+    Matches:
+    - ``include`` nodes: ``node.ref == argument`` (the ``path_in_repo`` value).
+    - ``source`` nodes: ``node.ref == argument`` when the source carries a root
+      manifest path in ``ref`` (set on the live-resolve path to
+      ``MPM_SOURCE_<name>_PATH``).
+
+    Args:
+        tree: The fully resolved dependency tree.
+        argument: The raw argument string from the CLI.
+
+    Returns:
+        List of ChainNode objects (include or source) whose ``ref`` exactly equals
+        the argument.  Empty when no match.
+    """
+    matches: list[ChainNode] = []
+
+    for source_node in tree.sources:
+        if source_node.ref is not None and source_node.ref == argument:
+            matches.append(source_node)
+
+    def _collect_includes(node: ChainNode) -> None:
+        if node.kind == "include" and node.ref == argument:
+            matches.append(node)
+        for child in node.children:
+            _collect_includes(child)
+
+    for source_node in tree.sources:
+        _collect_includes(source_node)
+
+    return matches
+
+
+def _match_by_source_name(tree: ResolvedTree, argument: str) -> list[ChainNode]:
+    """Match the argument against top-level source nodes via derive_source_name normalization.
+
+    The argument and each source node's name are both normalized with
+    derive_source_name before comparison, so case differences and dash/underscore
+    differences are ignored.
+
+    Args:
+        tree: The fully resolved dependency tree.
+        argument: The raw argument string from the CLI.
+
+    Returns:
+        List of source ChainNode objects whose normalized name equals the normalized
+        argument. Empty when no match.
+    """
+    normalized_arg = derive_source_name(argument, warn=False)
+    return [source for source in tree.sources if derive_source_name(source.name) == normalized_arg]
+
+
+def _match_by_include_name(tree: ResolvedTree, argument: str) -> list[ChainNode]:
+    """Match the argument against transitive include nodes by normalized name.
+
+    The argument and each include node's name are normalized via derive_source_name
+    (warn=False) before comparison, mirroring source-name matching so case and
+    dash/underscore differences are equivalent. Includes nest at any depth, so the
+    whole tree is walked.
+
+    Args:
+        tree: The fully resolved dependency tree.
+        argument: The raw argument string from the CLI.
+
+    Returns:
+        List of include ChainNode objects whose normalized name equals the
+        normalized argument. Empty when no match.
+    """
+    normalized_arg = derive_source_name(argument, warn=False)
+    matches: list[ChainNode] = []
+
+    def _collect_includes(node: ChainNode) -> None:
+        if node.kind == "include" and derive_source_name(node.name, warn=False) == normalized_arg:
+            matches.append(node)
+        for child in node.children:
+            _collect_includes(child)
+
+    for source_node in tree.sources:
+        _collect_includes(source_node)
+
+    return matches
+
+
+def _node_identity(node: ChainNode) -> tuple[str, ...]:
+    """Return the value-based logical-identity key for a matched node.
+
+    Two matched nodes with equal identity are the same logical dependency, so the
+    command prints all of their chains together; two nodes with different identity
+    are distinct interpretations and trigger the ambiguity error. Keys are
+    namespaced by node.kind so a source and an include can never collide, and they
+    are value-based because the lockfile tree builder clones project and include
+    nodes (object identity would over-count the same logical node).
+
+    Identity per kind:
+      - project: (kind, canonical_url)
+      - include: (kind, path_in_repo, sha) -- include url is always None
+      - source:  (kind, normalized name)
+    """
+    if node.kind == "project":
+        return (node.kind, node.canonical_url or "")
+    if node.kind == "include":
+        return (node.kind, node.ref or "", node.sha)
+    return (node.kind, derive_source_name(node.name, warn=False))
+
+
+@dataclass
+class _MatchHit:
+    """A single match result from one of the three matching categories.
+
+    Attributes:
+        category: One of 'url', 'xml_path', 'source_name'.
+        label: Human-readable description of the matched value for the error message.
+        node: The matched ChainNode.
+    """
+
+    category: str
+    label: str
+    node: ChainNode
+
+
+@dataclass
+class _ResolvedIdentity:
+    """One logical match identity and every node that realizes it.
+
+    Two matched nodes with the same _node_identity are the same logical thing: the
+    command prints all of their chains under one match annotation. Two nodes with
+    different identity are distinct interpretations and raise the ambiguity error.
+
+    Attributes:
+        category: The category token for the annotation and JSON payload. One of
+            'url', 'xml_path', 'source_name', 'include_name'.
+        token: The single canonical token shown to the user (canonical URL, XML
+            manifest path, or normalized source/include name), derived from the
+            identity rather than the raw argument.
+        nodes: Every matched ChainNode sharing this identity (at least one).
+    """
+
+    category: str
+    token: str
+    nodes: list[ChainNode]
+
+
+def _identity_token(hit: _MatchHit) -> str:
+    """Return the canonical, re-passable token to display for a matched identity.
+
+    The token is the user-facing canonical form of what matched and must be a
+    valid ``mpm why`` argument that resolves back to this one identity (it is
+    what the ambiguity message tells the operator to "pass one of"). For a
+    project URL match it is the canonical project URL; for an XML-path match the
+    exact manifest path; for an include/source-name match the name. For a
+    URL match on a SOURCE node it is the source ALIAS (its
+    ``derive_source_name`` identity), NOT the repository URL: several sources may
+    share one URL at different commits, so the URL is not distinct between them,
+    while the alias is -- and it round-trips through the source-name grammar
+    (matthew-dresden/mpm#86). It is derived from the matched node, never from
+    the raw argument.
+    """
+    node = hit.node
+    if hit.category == "url":
+        if node.kind == "source":
+            return derive_source_name(node.name, warn=False)
+        return node.canonical_url or ""
+    if hit.category == "xml_path":
+        return node.ref or ""
+    return node.name
+
+
+def _identity_label(hit: _MatchHit) -> str:
+    """Return the human-readable interpretation label for the ambiguity message."""
+    if hit.category == "url":
+        return "source name" if hit.node.kind == "source" else "project URL"
+    if hit.category == "xml_path":
+        return "XML manifest path"
+    if hit.category == "source_name":
+        return "source name"
+    return "include name"
+
+
+def _resolve_match(tree: ResolvedTree, argument: str) -> _ResolvedIdentity:
+    """Evaluate every matching category and resolve to a single logical identity.
+
+    All four categories are evaluated (URL, XML path, source name, include name);
+    there is no stop-at-first-match. Matched nodes are grouped by value-based
+    logical identity (see _node_identity), so the same logical thing matched many
+    times -- e.g. a transitive include pulled in by many top-level sources --
+    collapses to one identity and resolves successfully: every chain is printed.
+    Only two or more distinct identities is an ambiguity.
+
+    When zero matches are found, the not-found error includes a closest-match
+    suggestion list (up to MPM_WHY_SUGGEST_TOP_N candidates within
+    MPM_WHY_SUGGEST_MAX_DISTANCE Levenshtein edit distance).
+
+    Args:
+        tree: The fully resolved dependency tree.
+        argument: The raw argument string from the CLI.
+
+    Returns:
+        The single _ResolvedIdentity when all matches share one logical identity.
+
+    Raises:
+        SystemExit(1): When zero matches are found (not-found).
+        SystemExit(1): When two or more distinct identities match (ambiguity).
+    """
+    hits: list[_MatchHit] = []
+
+    for node in _match_by_url(tree, argument):
+        if node.kind == "source":
+            url_label = node.url or argument
+            label = f"source URL '{url_label}'"
+        else:
+            assert node.canonical_url is not None, (
+                f"project node {node.name!r} matched by URL but has no canonical_url (internal invariant)"
+            )
+            label = f"project URL '{node.canonical_url}'"
+        hits.append(_MatchHit(category="url", label=label, node=node))
+
+    for node in _match_by_xml_path(tree, argument):
+        hits.append(_MatchHit(category="xml_path", label=f"XML manifest path '{node.ref}'", node=node))
+
+    for node in _match_by_source_name(tree, argument):
+        hits.append(_MatchHit(category="source_name", label=f"source name '{node.name}'", node=node))
+
+    for node in _match_by_include_name(tree, argument):
+        hits.append(_MatchHit(category="include_name", label=f"include name '{node.name}'", node=node))
+
+    if not hits:
+        universe = _build_suggestion_universe(tree)
+        suggestions = _suggest_closest_matches(
+            argument,
+            universe,
+            max_distance=MPM_WHY_SUGGEST_MAX_DISTANCE,
+            top_n=MPM_WHY_SUGGEST_TOP_N,
+        )
+        if suggestions:
+            suggestion_lines = "\n".join(f"  {s}" for s in suggestions)
+            print(
+                f"ERROR: {argument} not found in resolved tree\nDid you mean one of:\n{suggestion_lines}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ERROR: {argument} not found in resolved tree\nNo close matches found.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    groups: dict[tuple[str, ...], list[_MatchHit]] = {}
+    for hit in hits:
+        groups.setdefault(_node_identity(hit.node), []).append(hit)
+
+    if len(groups) >= 2:
+        interpretations = "\n".join(
+            f"  {_identity_label(group[0])}: {_identity_token(group[0])}" for group in groups.values()
+        )
+        print(
+            f"ERROR: argument '{argument}' is ambiguous: it matches {len(groups)} distinct interpretations:\n"
+            f"{interpretations}\n"
+            "Disambiguate by passing one of the exact tokens above.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    representative_hits = next(iter(groups.values()))
+    representative = representative_hits[0]
+
+    deduped_nodes: list[ChainNode] = []
+    seen_ids: set[int] = set()
+    for hit in representative_hits:
+        if id(hit.node) not in seen_ids:
+            seen_ids.add(id(hit.node))
+            deduped_nodes.append(hit.node)
+
+    return _ResolvedIdentity(
+        category=representative.category,
+        token=_identity_token(representative),
+        nodes=deduped_nodes,
+    )
+
+
+def _collect_chains_for_identity(tree: ResolvedTree, identity: _ResolvedIdentity) -> list[list[ChainNode]]:
+    """Collect the union of all chains reaching any node of the matched identity.
+
+    A project URL identity delegates to _walk_chains once (it already traverses the
+    whole tree and finds every chain ending at the canonical URL). Include, source,
+    and source-URL identities call _walk_chains_from_node per matched node and
+    concatenate, de-duplicating by a value signature so diamond includes and cloned
+    nodes collapse to one chain while first-seen order is preserved.
+
+    Args:
+        tree: The fully resolved dependency tree.
+        identity: The resolved match identity (one or more nodes of one kind).
+
+    Returns:
+        The list of chains to render. Empty when no chain reaches the identity.
+    """
+    project_nodes = [node for node in identity.nodes if node.kind == "project"]
+    if identity.category == "url" and project_nodes:
+        target_canonical = project_nodes[0].canonical_url
+        if target_canonical is None:
+            print(
+                f"ERROR: matched project node '{project_nodes[0].name}' has no canonical URL (internal error)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return _walk_chains(tree, target_canonical)
+
+    collected: list[list[ChainNode]] = []
+    seen_signatures: set[tuple[tuple[str, str, str | None, str], ...]] = set()
+    for node in identity.nodes:
+        for chain in _walk_chains_from_node(tree, node):
+            signature = tuple((member.kind, member.name, member.ref, member.sha) for member in chain)
+            if signature not in seen_signatures:
+                seen_signatures.add(signature)
+                collected.append(chain)
+    return collected
+
+
+def _build_suggestion_universe(tree: ResolvedTree) -> list[str]:
+    """Build the universe of candidate strings for closest-match suggestions.
+
+    The universe is the union of:
+    - Every top-level source name (as stored in the tree, not normalized).
+    - Every include node's path_in_repo value (XML manifest paths) and name.
+    - Every project node's canonical_url value.
+
+    Args:
+        tree: The fully resolved dependency tree.
+
+    Returns:
+        A list of all candidate strings (may contain duplicates if the tree
+        has repeated entries, but duplicates are harmless for the suggester).
+    """
+    candidates: list[str] = []
+
+    def _collect(node: ChainNode) -> None:
+        if node.kind == "source":
+            candidates.append(node.name)
+        elif node.kind == "include":
+            if node.ref is not None:
+                candidates.append(node.ref)
+            candidates.append(node.name)
+        elif node.kind == "project" and node.canonical_url is not None:
+            candidates.append(node.canonical_url)
+        for child in node.children:
+            _collect(child)
+
+    for source_node in tree.sources:
+        _collect(source_node)
+
+    return candidates
+
+
+def _suggest_closest_matches(
+    argument: str,
+    universe: list[str],
+    max_distance: int,
+    top_n: int,
+) -> list[str]:
+    """Return the top closest matches from the universe to the argument.
+
+    Only candidates with Levenshtein edit distance <= max_distance are eligible.
+    Results are sorted ascending by (distance, candidate_value) for deterministic
+    output, and truncated to at most top_n entries.
+
+    Args:
+        argument: The string to compare against.
+        universe: The list of candidate strings to search.
+        max_distance: Maximum edit distance for a candidate to be eligible.
+        top_n: Maximum number of candidates to return.
+
+    Returns:
+        A list of at most top_n candidate strings, sorted ascending by
+        (distance, lexicographic value). Empty list when no candidate is
+        within max_distance.
+    """
+    scored: list[tuple[int, str]] = []
+    for candidate in universe:
+        dist = levenshtein_distance(argument, candidate)
+        if dist <= max_distance:
+            scored.append((dist, candidate))
+
+    scored.sort(key=lambda pair: (pair[0], pair[1]))
+    return [candidate for _, candidate in scored[:top_n]]
+
+
+def _node_display(node: ChainNode) -> str:
+    """Format a single node for the text-format chain display.
+
+    Rules:
+      - Source nodes: just the source name (no '@sha' -- it is the anchor).
+      - Include nodes: '<name>@<sha>' where name is the path_in_repo value.
+      - Project nodes: '<name>@<sha>'.
+
+    Args:
+        node: The ChainNode to format.
+
+    Returns:
+        The display string for this node.
+    """
+    if node.kind == "source":
+        return node.name
+    if node.kind == "include":
+        label = node.ref if node.ref else node.name
+        return f"{label}@{node.sha}"
+
+    return f"{node.name}@{node.sha}"
+
+
+def _build_alias_renders(mpm_path: pathlib.Path) -> dict[str, str]:
+    """Build the alias -> render-string map from the parsed ``.mpm`` file.
+
+    For each source block the render string is ``alias -> name from <url>@<ref>``
+    (spec Section 5.1 / FR-59, FR-6), where ``name`` is the per-dependency
+    ``MPM_SOURCE_<alias>_NAME`` value (the original catalog manifest name) and
+    ``ref`` is the verbatim ``MPM_SOURCE_<alias>_REF`` spec. The map is keyed by
+    the alias so callers can render only the aliases that appear in the resolved
+    chains.
+
+    Args:
+        mpm_path: Path to the ``.mpm`` file.
+
+    Returns:
+        Dict mapping each source alias to its ``alias -> name from <url>@<ref>``
+        render string.
+
+    Raises:
+        ValueError: From ``parse_mpmenv`` when the ``.mpm`` file is malformed
+            or missing required source variables.
+    """
+    mpmenv = parse_mpmenv(mpm_path)
+    renders: dict[str, str] = {}
+    for alias in mpmenv["MPM_SOURCES"]:
+        source = mpmenv["sources"][alias]
+        renders[alias] = f"{alias} -> {source['name']} from {source['url']}@{source['ref']}"
+    return renders
+
+
+def _alias_renders_for_chains(
+    chains: list[list[ChainNode]],
+    alias_renders: dict[str, str],
+) -> list[str]:
+    """Return the alias-render strings for every source node present in the chains.
+
+    Walks each chain's leading source node, looks its name up in
+    ``alias_renders`` (the alias -> ``alias -> name from <url>@<ref>`` map), and
+    returns the render strings in first-seen order with no duplicates. Source
+    aliases that have no entry in ``alias_renders`` (e.g. live-resolve-only
+    sources not present in the parsed ``.mpm`` map) are skipped without error.
+
+    Args:
+        chains: The resolved chains; each chain begins with a source node.
+        alias_renders: The alias -> render-string map from ``_build_alias_renders``.
+
+    Returns:
+        The ordered, de-duplicated list of render strings for the chains' sources.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for chain in chains:
+        if not chain:
+            continue
+        source_alias = chain[0].name
+        if source_alias in seen or source_alias not in alias_renders:
+            continue
+        seen.add(source_alias)
+        ordered.append(alias_renders[source_alias])
+    return ordered
+
+
+def _render_text(chains: list[list[ChainNode]]) -> list[str]:
+    """Render a list of chains to the text-format output lines.
+
+    Each chain becomes one line of the form:
+      <source> -> <include>@<sha> -> ... -> <project>@<sha>
+
+    Args:
+        chains: A list of chains, each chain being a list of ChainNode objects.
+
+    Returns:
+        A list of formatted line strings (one per chain), without trailing newlines.
+    """
+    lines: list[str] = []
+    for chain in chains:
+        parts = [_node_display(node) for node in chain]
+        lines.append(" -> ".join(parts))
+    return lines
+
+
+def _chain_to_node_dicts(chain: list[ChainNode]) -> list[dict[str, object]]:
+    """Convert a single chain (list of ChainNode) into the spec-shaped list of node dicts.
+
+    Each node dict has exactly five keys: kind, name, ref, sha, url.
+
+    Field semantics:
+      - kind: one of 'source', 'include', 'project'.
+      - name: human-readable identifier of the node.
+      - ref: path_in_repo for include nodes; None for source and project nodes.
+      - sha: full 40-char hex SHA.
+      - url: for project nodes, node.canonical_url (canonicalized via canonicalize_repo_url);
+             for source nodes, node.url (raw URL as stored in the lockfile);
+             for include nodes, None (XML manifest paths have no standalone URL).
+
+    Args:
+        chain: A list of ChainNode objects representing one resolved chain.
+
+    Returns:
+        A list of node dicts suitable for JSON serialization.
+    """
+    result: list[dict[str, object]] = []
+    for node in chain:
+        if node.kind == "project":
+            url_value: object = node.canonical_url
+        else:
+            url_value = node.url
+        result.append(
+            {
+                "kind": node.kind,
+                "name": node.name,
+                "ref": node.ref,
+                "sha": node.sha,
+                "url": url_value,
+            }
+        )
+    return result
+
+
+def _build_why_payload(chains: list[list[ChainNode]]) -> list[list[dict[str, object]]]:
+    """Build the JSON-serialisable payload for a list of chains.
+
+    Returns a nested list: the outer list contains one element per chain;
+    each inner list contains one node-dict per hop.
+
+    Args:
+        chains: A list of chains, each chain being a list of ChainNode objects.
+
+    Returns:
+        A list-of-lists of dicts ready for JSON serialisation.
+    """
+    return [_chain_to_node_dicts(chain) for chain in chains]
+
+
+def _render_json(chains: list[list[ChainNode]]) -> str:
+    """Render a list of chains to a JSON string (spec Section 4.5 step 4).
+
+    The output is a top-level JSON array of chains. Each chain is a list of
+    node objects with exactly five keys: kind, name, ref, sha, url.
+
+    Kept for backward compatibility with callers that need the serialised
+    string directly (e.g. unit tests).  The :func:`run_why` handler calls
+    :func:`_emit_json_payload` via :func:`_build_why_payload` directly.
+
+    Args:
+        chains: A list of chains, each chain being a list of ChainNode objects.
+
+    Returns:
+        A JSON string representation of all chains, terminated with a newline.
+    """
+    return json.dumps(_build_why_payload(chains), sort_keys=False, indent=MPM_WHY_JSON_INDENT) + "\n"
+
+
+def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """Register the 'why' subcommand on the top-level argparse subparsers.
+
+    Args:
+        subparsers: The subparsers action from the top-level parser.
+    """
+    parser: argparse.ArgumentParser = subparsers.add_parser(
+        "why",
+        add_help=True,
+        help="Explain why a project is in the resolved dependency tree.",
+        description=(
+            "Reads the .mpm file, resolves the full dependency tree\n"
+            "(from .mpm.lock when present, else live-resolves against\n"
+            "the catalog), and prints every chain reaching the requested\n"
+            "node.\n\n"
+            "Argument matching (all categories evaluated, grouped by identity):\n"
+            "  (a) <project> repo URL -- canonicalized via canonicalize_repo_url.\n"
+            "  (b) Transitive XML manifest path -- exact-string equality.\n"
+            "  (c) Top-level source name -- normalized via derive_source_name.\n"
+            "  (d) Transitive include name -- normalized via derive_source_name.\n"
+            "The same node reached by many chains prints all of them; only two or\n"
+            "more distinct interpretations is an ambiguity.\n\n"
+            "Chain format:\n"
+            "  <top-source> -> <xml-path>@<sha> -> ... -> <project>@<sha>\n\n"
+            "Catalog source precedence: --catalog-source flag, then the single\n"
+            "MPM_CATALOG_SOURCES env-var entry. Required only when .mpm.lock\n"
+            "is absent (live-resolve path)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "target",
+        metavar="<project-url-or-name>",
+        help=(
+            "The project URL, XML manifest path, source name, or transitive include name to look up. "
+            "Project URLs are canonicalized via canonicalize_repo_url before matching. "
+            "XML manifest paths are matched by exact string equality. "
+            "Source and include names are normalized via derive_source_name (case- and separator-insensitive)."
+        ),
+    )
+
+    add_catalog_source_arg(parser)
+
+    parser.add_argument(
+        "--mpm-file",
+        dest="mpm_file",
+        default=os.environ.get(MPM_MPM_FILE_ENV, MPM_MPM_FILE_DEFAULT),
+        metavar="<path>",
+        help=(
+            f"Path to the .mpm file. "
+            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            "the CLI flag takes precedence when both are set."
+        ),
+    )
+
+    parser.add_argument(
+        "--lock-file",
+        dest="lock_file",
+        default=os.environ.get(MPM_LOCK_FILE),
+        metavar="<path>",
+        help=(
+            "Path to the .mpm.lock file. "
+            "When present, the tree is built from lockfile entries (no git calls). "
+            "When absent, the command live-resolves against the catalog. "
+            f"Defaults to <mpm-file>.lock. "
+            f"Overridden by the {MPM_LOCK_FILE} environment variable; "
+            "the CLI flag takes precedence when both are set."
+        ),
+    )
+
+    parser.add_argument(
+        "--format",
+        dest="format",
+        default=os.environ.get(MPM_WHY_FORMAT, MPM_WHY_FORMAT_DEFAULT),
+        choices=(MPM_WHY_FORMAT_DEFAULT, MPM_WHY_FORMAT_JSON),
+        metavar="<format>",
+        help=(
+            "Output format: 'text' (default) or 'json'. "
+            f"Overridden by the {MPM_WHY_FORMAT} environment variable; "
+            "the CLI flag takes precedence when both are set."
+        ),
+    )
+
+    parser.set_defaults(func=run)
+
+
+def run(args: argparse.Namespace) -> int:
+    """Execute the 'mpm why' command.
+
+    Reads the .mpm file, resolves the dependency tree (from .mpm.lock
+    when present, else live-resolves), finds all chains ending at the
+    requested node, and prints them to stdout.
+
+    Argument matching evaluates all three categories (URL, XML path, source name)
+    before deciding. Zero matches -> not-found error. Two or more matches ->
+    ambiguity hard error. Exactly one match -> chain walker runs.
+
+    Args:
+        args: Parsed argparse namespace. Expected attributes:
+            - ``target`` (str): the project URL, XML path, or source name to look up.
+            - ``mpm_file`` (str): path to the .mpm file.
+            - ``lock_file`` (str | None): path to the lockfile, or None.
+            - ``catalog_source`` (str | None): catalog source string.
+            - ``format`` (str): output format -- 'text' or 'json'.
+
+    Returns:
+        0 on success. Non-zero on error (but most errors call sys.exit directly).
+    """
+
+    mpm_path = pathlib.Path(args.mpm_file)
+    if not mpm_path.exists():
+        print(
+            f"ERROR: .mpm file not found: {mpm_path}\n"
+            f"Provide a valid path via --mpm-file or the {MPM_MPM_FILE_ENV} env var.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resolved_lock_path = derive_lock_file_path(
+        cli_lock_file=pathlib.Path(args.lock_file) if args.lock_file else None,
+        env_lock_file=os.environ.get(MPM_LOCK_FILE),
+        mpm_file_path=mpm_path,
+    )
+
+    if args.lock_file is not None and not resolved_lock_path.exists():
+        print(
+            f"ERROR: lock file not found: {args.lock_file}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if resolved_lock_path.exists():
+        lock_file_path: pathlib.Path | None = resolved_lock_path
+    else:
+        lock_file_path = None
+
+    if lock_file_path is not None and lock_file_path.exists():
+        lockfile = read_lockfile(lock_file_path)
+        tree = _build_tree_from_lockfile(lockfile)
+    else:
+        catalog_source: str | None = args.catalog_source or resolve_env_catalog_source()
+        if not catalog_source:
+            print(
+                MISSING_CATALOG_ERROR_TEMPLATE.format(command="mpm why"),
+                file=sys.stderr,
+                end="",
+            )
+            sys.exit(1)
+
+        try:
+            tree = _live_resolve_tree(mpm_path, catalog_source)
+        except LiveResolveError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+
+    identity = _resolve_match(tree, args.target)
+    chains = _collect_chains_for_identity(tree, identity)
+
+    if not chains:
+        print(
+            f"ERROR: {args.target} not found in resolved tree",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    matched_token = identity.token
+
+    alias_renders_map = _build_alias_renders(mpm_path)
+    chain_alias_renders = _alias_renders_for_chains(chains, alias_renders_map)
+
+    if args.format == MPM_WHY_FORMAT_JSON:
+        from mpm_cli.cli import _emit_json_payload
+
+        why_payload = {
+            "matched": {"category": identity.category, "token": matched_token},
+            "aliases": chain_alias_renders,
+            "chains": _build_why_payload(chains),
+        }
+        _emit_json_payload(why_payload, sort_keys=False, indent=MPM_WHY_JSON_INDENT)
+    else:
+        print(f"matched {identity.category} '{matched_token}'")
+        for alias_render in chain_alias_renders:
+            print(alias_render)
+        lines = _render_text(chains)
+        for line in lines:
+            print(line)
+
+    return 0

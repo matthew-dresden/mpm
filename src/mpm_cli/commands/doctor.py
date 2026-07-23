@@ -1,0 +1,1474 @@
+"""mpm doctor subcommand: workspace health checks and cache refresh.
+
+Performs workspace health checks and optionally refreshes the completion cache
+or prunes stale cache files.
+The --refresh-completion-cache flag invalidates all files under
+<MPM_HOME>/cache/completion-cache/ (the cache root resolved from MPM_HOME).
+The --prune-cache flag removes cache files whose atime is older than
+MPM_CACHE_PRUNE_AGE_DAYS days and reports stale install-lock advisories.
+
+Spec reference: ``spec/mpm-list-add-lock-features-spec.md``
+Section 4.6 (mpm doctor subchecks 1-5, 7-11), Section 5.1 (mpm_hash),
+Section 7 (retry policy, MPM_RESOLVE_TIMEOUT),
+Section 11 (cache layout), Section 3.6 (cache files user-private mode 0700).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import os
+import pathlib
+import re
+import shutil
+import sys
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from mpm_cli.core.lockfile import Lockfile
+
+from mpm_cli.completions.cache import cache_dir as resolve_cache_dir
+from mpm_cli.constants import (
+    CATALOG_SOURCES_ENV_VAR,
+    FINDING_PREFIX_FAIL,
+    FINDING_PREFIX_INFO,
+    FINDING_PREFIX_OK,
+    FINDING_SEVERITY_FAIL,
+    FINDING_SEVERITY_INFO,
+    FINDING_SEVERITY_OK,
+    GIT_RETRY_COUNT_DEFAULT,
+    GIT_RETRY_COUNT_ENV_VAR,
+    GIT_RETRY_DELAY_DEFAULT,
+    GIT_RETRY_DELAY_ENV_VAR,
+    INSTALL_LOCK_FILENAME,
+    MPM_CACHE_PRUNE_AGE_DAYS,
+    MPM_COMPLETION_CACHE_DIR,
+    MPM_COMPLETION_ERRORS_LOG_FILENAME,
+    MPM_COMPLETION_ERRORS_REPORT_LIMIT,
+    MPM_DOCTOR_REMOTE_STDERR_PREVIEW_CHARS,
+    MPM_DOCTOR_STALE_LOCK_AGE_HOURS,
+    MPM_DOCTOR_STALE_LOCK_SCAN_MAX_DEPTH,
+    MPM_HOME_CACHE_DIR_MODE,
+    MPM_MPM_FILE_DEFAULT,
+    MPM_MPM_FILE_ENV,
+    MPM_LOCK_FILE,
+    MPM_STALE_COMPLETION_SCRIPT_WARNING,
+    MPM_STATIC_COMPLETION_SEARCH_PATHS,
+    _MPM_RESOLVE_TIMEOUT_DEFAULT,
+    _MPM_RESOLVE_TIMEOUT_ENV,
+)
+from mpm_cli.core.catalog import parse_catalog_sources
+from mpm_cli.core.cli_args import add_catalog_source_arg
+from mpm_cli.core.git_runner import run_git_ls_remote
+
+
+_UNSET: object = object()
+
+
+WORKSPACE_FREE_FLAGS: frozenset[str] = frozenset({"refresh_completion_cache", "prune_cache"})
+
+
+class DoctorArgsTypeError(TypeError):
+    """Raised when doctor_command receives args that is not an argparse.Namespace.
+
+    The CLI layer is responsible for catching this and emitting a structured
+    ERROR message with non-zero exit code.
+
+    Attributes:
+        received_type: The type that was passed instead of argparse.Namespace.
+    """
+
+    def __init__(self, received_type: type) -> None:
+        self.received_type = received_type
+        super().__init__(
+            f"args must be an argparse.Namespace; got {received_type!r}. Supply a valid Namespace from argparse."
+        )
+
+
+DOCTOR_SUBCHECK_MPM_HASH = "mpm_hash consistency"
+DOCTOR_SUBCHECK_ORPHAN_LOCKS = "no orphaned lock entries"
+DOCTOR_SUBCHECK_BRANCH_DRIFT = "no branch drift"
+
+
+class DoctorContractError(RuntimeError):
+    """Raised when a subcheck handler returns a value that is not a Finding.
+
+    This exception surfaces a programming-contract violation immediately so
+    that a refactor miss is caught at runtime rather than silently degrading
+    the structured output.
+
+    Attributes:
+        handler_name: Name of the subcheck handler that violated the contract.
+        received: The unexpected return value.
+    """
+
+    def __init__(self, handler_name: str, received: object) -> None:
+        self.handler_name = handler_name
+        self.received = received
+        super().__init__(
+            f"Subcheck handler '{handler_name}' returned {type(received)!r} instead of Finding. "
+            "All subcheck handlers must return a Finding instance."
+        )
+
+
+_VALID_FINDING_SEVERITIES: frozenset[str] = frozenset(
+    {FINDING_SEVERITY_OK, FINDING_SEVERITY_FAIL, FINDING_SEVERITY_INFO}
+)
+
+
+@dataclass(frozen=True)
+class Finding:
+    """A structured output record produced by the doctor dispatcher.
+
+    Each Finding corresponds to one named subcheck. The dispatcher iterates
+    findings and prints them per the severity-to-prefix map:
+      - ok   -> "[ok] <name>"
+      - fail -> "[fail] <name>: <reason>"
+      - info -> "[info] <name>" or "[info] <name>: <reason>" when reason is set
+
+    Attributes:
+        severity: One of FINDING_SEVERITY_OK, FINDING_SEVERITY_FAIL, or
+            FINDING_SEVERITY_INFO. Validated in __post_init__.
+        name: Subcheck identifier string (e.g. DOCTOR_SUBCHECK_MPM_HASH).
+        reason: Optional detail string. Populated for fail/info severities;
+            None for ok findings.
+    """
+
+    severity: str
+    name: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that severity is one of the three allowed values."""
+        if self.severity not in _VALID_FINDING_SEVERITIES:
+            raise ValueError(
+                f"Finding.severity must be one of {sorted(_VALID_FINDING_SEVERITIES)!r}; got {self.severity!r}"
+            )
+
+
+@dataclass
+class DoctorFinding:
+    """A single finding produced by one mpm doctor subcheck.
+
+    Attributes:
+        kind: Severity of the finding -- one of "info", "warn", or "error".
+        code: A short machine-readable identifier for the finding type.
+        message: Human-readable description of the finding.
+        remediation: Suggested command or action to resolve the finding.
+    """
+
+    kind: str
+    code: str
+    message: str
+    remediation: str
+
+
+_SHA_RE = re.compile(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+
+
+def _is_branch_revision(revision_spec: str) -> bool:
+    """Return True if revision_spec looks like a branch name (not a SHA or refs/ ref).
+
+    A revision is treated as branch-pinned when it does NOT match a full SHA
+    (40 or 64 lowercase hex chars) and does NOT start with ``refs/``.
+
+    Args:
+        revision_spec: The revision string from the lockfile.
+
+    Returns:
+        True if the revision should be treated as a branch ref to drift-check.
+    """
+    if _SHA_RE.match(revision_spec):
+        return False
+    if revision_spec.startswith("refs/"):
+        return False
+    return True
+
+
+def _run_ls_remote(
+    url: str,
+    ref: str,
+    timeout: int,
+    retry_count: int,
+    retry_delay: float,
+) -> tuple[int, str, str]:
+    """Run ``git ls-remote <url> <ref>`` with retry and timeout policy.
+
+    Delegates to ``mpm_cli.core.git_runner.run_git_ls_remote``.
+
+    When ``ref`` is an empty string, runs ``git ls-remote <url>`` (no ref
+    pattern) to list all refs. This is required for SHA reachability checks
+    since ``git ls-remote --exit-code <url> <sha>`` only matches against
+    ref *names*, not against SHA values in the first column.
+
+    Args:
+        url: The git remote URL to query.
+        ref: The ref to look up (branch name or refs/... path). Pass an empty
+            string to list all refs without filtering.
+        timeout: Per-attempt timeout in seconds.
+        retry_count: Maximum number of attempts (1 means no retries).
+        retry_delay: Unused. Retained for call-site compatibility while
+            existing callers are migrated. The retry loop in git_runner uses
+            no time-based delay (spec Section 3.5 / issue #64).
+
+    Returns:
+        A tuple (returncode, stdout, stderr) from the final attempt.
+    """
+    if ref:
+        cmd = ["git", "ls-remote", url, ref]
+    else:
+        cmd = ["git", "ls-remote", url]
+    return run_git_ls_remote(cmd, timeout, retry_count)
+
+
+def _run_ls_remote_exit_code(
+    url: str,
+    ref: str,
+    timeout: int,
+    retry_count: int,
+    retry_delay: float,
+) -> tuple[int, str, str]:
+    """Run ``git ls-remote --exit-code <url> <ref>`` with retry and timeout policy.
+
+    This variant always passes ``--exit-code`` so that git returns a non-zero
+    exit code when the remote exists but the requested ref is absent (in
+    addition to the normal non-zero on network/auth failures).  Used by
+    subcheck 11 (remote reachability) per spec Section 4.6.
+
+    Delegates to ``mpm_cli.core.git_runner.run_git_ls_remote``.
+
+    Args:
+        url: The git remote URL to query.
+        ref: The ref to look up (e.g. ``HEAD``).
+        timeout: Per-attempt timeout in seconds.
+        retry_count: Maximum number of attempts (1 means no retries).
+        retry_delay: Unused. Retained for call-site compatibility while
+            existing callers are migrated. The retry loop in git_runner uses
+            no time-based delay (spec Section 3.5 / issue #64).
+
+    Returns:
+        A tuple (returncode, stdout, stderr) from the final attempt.
+    """
+    cmd = ["git", "ls-remote", "--exit-code", url, ref]
+    return run_git_ls_remote(cmd, timeout, retry_count)
+
+
+def _check_mpm_hash(
+    mpm_file: pathlib.Path,
+    lock_file: pathlib.Path,
+) -> DoctorFinding | None:
+    """Check .mpm file existence and mpm_hash match against the lockfile.
+
+    Subcheck 1 in spec Section 4.6:
+    - If .mpm is absent: returns an error finding (code=NO_MPM).
+    - If .mpm.lock is absent: returns an info finding (code=NO_LOCKFILE).
+    - If the .mpm declares zero sources: returns an error finding
+      (code=NO_SOURCES). The mpm_hash recompute re-parses the .mpm file and
+      a zero-source workspace raises NoSourcesError; this is converted to a
+      structured finding rather than allowed to escape.
+    - If mpm_hash in lockfile differs from the recomputed hash: returns error
+      (code=HASH_MISMATCH).
+    - Otherwise: returns None (no finding -- checks 2-5 may proceed).
+
+    This function is pure: it performs no I/O on stdout/stderr. It catches the
+    zero-source NoSourcesError and reports it as a finding; any other parser
+    exception propagates to the caller.
+
+    Args:
+        mpm_file: Path to the .mpm file.
+        lock_file: Path to the .mpm.lock file.
+
+    Returns:
+        A DoctorFinding instance on failure/notice, or None on success.
+    """
+    if not mpm_file.exists():
+        cwd = mpm_file.parent
+        return DoctorFinding(
+            kind="error",
+            code="NO_MPM",
+            message=f"no mpm workspace in {cwd}: '{mpm_file.name}' not found",
+            remediation=("Run 'mpm add ...' to create a .mpm file, or 'cd' to a directory that contains one."),
+        )
+
+    if not lock_file.exists():
+        return DoctorFinding(
+            kind="info",
+            code="NO_LOCKFILE",
+            message="No lockfile present; run `mpm install` to generate one.",
+            remediation="mpm install",
+        )
+
+    from mpm_cli.core.mpm_hash import mpm_hash
+    from mpm_cli.core.mpmenv import NoSourcesError
+    from mpm_cli.core.lockfile import read_lockfile
+
+    lockfile = read_lockfile(lock_file)
+
+    try:
+        computed = mpm_hash(mpm_file)
+    except NoSourcesError:
+        return DoctorFinding(
+            kind="error",
+            code="NO_SOURCES",
+            message="no sources declared in .mpm; add one with 'mpm add <entry>'",
+            remediation="Run 'mpm add <entry>' to declare at least one source.",
+        )
+    if computed != lockfile.mpm_hash:
+        return DoctorFinding(
+            kind="error",
+            code="HASH_MISMATCH",
+            message=("mpm_hash mismatch: .mpm was hand-edited since the last 'mpm install'."),
+            remediation="Run 'mpm install --refresh-lock' to rebuild the lockfile.",
+        )
+
+    return None
+
+
+def _check_orphan_locks(
+    mpm_file: pathlib.Path,
+    lockfile: Lockfile,
+) -> list[DoctorFinding]:
+    """Check for lockfile entries whose source triples are absent from .mpm.
+
+    Subcheck 3 in spec Section 4.6: For every source recorded in the lockfile,
+    verify that the matching MPM_SOURCE_<name> source (discovered by its
+    required structural keys) exists in .mpm. Missing sources produce one
+    error finding per orphan; optional per-dependency env-var lines do not
+    affect presence.
+
+    This function is pure: no stdout/stderr side effects.
+
+    Args:
+        mpm_file: Path to the .mpm file.
+        lockfile: A Lockfile dataclass instance (from core/lockfile.py).
+
+    Returns:
+        List of DoctorFinding instances (empty when all sources are present).
+    """
+    from mpm_cli.core.mpmenv import parse_mpmenv
+
+    parsed = parse_mpmenv(mpm_file)
+    mpm_sources: set[str] = set(parsed["sources"].keys())
+
+    findings: list[DoctorFinding] = []
+    for source in lockfile.sources:
+        if source.name not in mpm_sources:
+            findings.append(
+                DoctorFinding(
+                    kind="error",
+                    code="ORPHAN_LOCK",
+                    message=(f"orphan lock entry: source '{source.name}' is in .mpm.lock but absent from .mpm"),
+                    remediation=(
+                        "Run 'mpm install --reconcile' to prune (or "
+                        "'mpm remove <name>' to drop the source from .mpm.lock)."
+                    ),
+                )
+            )
+
+    return findings
+
+
+class RetryPolicy(NamedTuple):
+    """Parameters controlling retry behaviour for git ls-remote calls.
+
+    Attributes:
+        timeout: Per-attempt timeout in seconds.
+        retry_count: Maximum number of attempts (1 means no retries).
+        retry_delay: Value read from ``MPM_GIT_RETRY_DELAY`` (seconds).
+            Not applied to the ``git ls-remote`` retry path: the doctor
+            delegates those calls to ``mpm_cli.core.git_runner.run_git_ls_remote``,
+            which uses immediate retries with no inter-attempt delay (spec 3.5 /
+            issue #64).
+    """
+
+    timeout: int
+    retry_count: int
+    retry_delay: float
+
+
+def _read_retry_policy() -> RetryPolicy:
+    """Read the git ls-remote retry policy from environment variables.
+
+    Reads the three environment variables that govern the retry and timeout
+    behaviour for all ``git ls-remote`` calls issued by ``mpm doctor``:
+
+    - ``MPM_RESOLVE_TIMEOUT`` -- per-attempt timeout in seconds (default
+      ``_MPM_RESOLVE_TIMEOUT_DEFAULT``).
+    - ``MPM_GIT_RETRY_COUNT`` -- maximum number of attempts, 1 means no
+      retries (default ``GIT_RETRY_COUNT_DEFAULT``).
+    - ``MPM_GIT_RETRY_DELAY`` -- read from the environment (default
+      ``GIT_RETRY_DELAY_DEFAULT``). Stored in ``RetryPolicy.retry_delay`` but
+      NOT applied to the ``git ls-remote`` retry path: those calls delegate to
+      ``mpm_cli.core.git_runner.run_git_ls_remote``, which performs immediate
+      retries with no inter-attempt delay (spec 3.5 / issue #64).
+
+    Extracting this into a factory keeps each call site DRY and makes it easy
+    to override all three values in a single place for testing.
+
+    Returns:
+        A ``RetryPolicy`` named tuple populated from the current environment.
+    """
+    timeout = int(os.environ.get(_MPM_RESOLVE_TIMEOUT_ENV, str(_MPM_RESOLVE_TIMEOUT_DEFAULT)))
+    retry_count = int(os.environ.get(GIT_RETRY_COUNT_ENV_VAR, str(GIT_RETRY_COUNT_DEFAULT)))
+    retry_delay = float(os.environ.get(GIT_RETRY_DELAY_ENV_VAR, str(GIT_RETRY_DELAY_DEFAULT)))
+    return RetryPolicy(timeout=timeout, retry_count=retry_count, retry_delay=retry_delay)
+
+
+def _check_branch_drift(
+    lockfile: Lockfile,
+    strict_drift: bool,
+) -> list[DoctorFinding]:
+    """Check branch-pinned sources for drift between locked SHA and current tip.
+
+    Subcheck 4 in spec Section 4.6: For every lockfile entry whose ref_spec
+    resolves to a branch ref (not a SHA, not refs/...), query
+    ``git ls-remote refs/heads/<branch>`` against the source URL. When the
+    branch tip SHA differs from the lockfile-recorded SHA:
+    - Without ``--strict-drift``: emit an info-level finding.
+    - With ``--strict-drift``: emit an error-level finding.
+
+    SHA-pinned sources (40/64 hex-char ref_spec) are skipped.
+
+    This function is pure: no stdout/stderr side effects.
+
+    Args:
+        lockfile: A Lockfile dataclass instance.
+        strict_drift: When True, drift findings are promoted to error level.
+
+    Returns:
+        List of DoctorFinding instances (empty when no drift detected).
+    """
+    _policy = _read_retry_policy()
+
+    findings: list[DoctorFinding] = []
+    for source in lockfile.sources:
+        if not _is_branch_revision(source.ref_spec):
+            continue
+
+        branch = source.ref_spec
+        ref = f"refs/heads/{branch}"
+        returncode, stdout, stderr = _run_ls_remote(
+            url=source.url,
+            ref=ref,
+            timeout=_policy.timeout,
+            retry_count=_policy.retry_count,
+            retry_delay=_policy.retry_delay,
+        )
+
+        if returncode != 0:
+            continue
+
+        current_sha: str | None = None
+        for line in stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[1].strip() == ref:
+                current_sha = parts[0].strip()
+                break
+
+        if current_sha is None:
+            continue
+
+        if current_sha != source.resolved_sha:
+            kind = "error" if strict_drift else "info"
+            findings.append(
+                DoctorFinding(
+                    kind=kind,
+                    code="BRANCH_DRIFT",
+                    message=(
+                        f"branch drift: source '{source.name}' is locked to "
+                        f"{source.resolved_sha[:12]} but '{branch}' is now at "
+                        f"{current_sha[:12]}"
+                    ),
+                    remediation="Run 'mpm install --refresh-lock' to update the lockfile.",
+                )
+            )
+
+    return findings
+
+
+def _check_dangling_shas(
+    lockfile: Lockfile,
+) -> list[DoctorFinding]:
+    """Check that every locked SHA is still reachable via git ls-remote.
+
+    Subcheck 5 in spec Section 4.6: For every lockfile source entry, run
+    ``git ls-remote <url>`` (no pattern) to list all remote refs, then
+    search the first column of each line for the locked SHA. A SHA that
+    does not appear in any ref's first column is considered dangling
+    (force-pushed or pruned). A non-zero exit from git ls-remote is also
+    treated as a dangling-SHA error.
+
+    Note: ``git ls-remote --exit-code <url> <sha>`` is NOT used here
+    because it matches against ref *names* (second column), not against
+    SHA values (first column). A bare SHA will never match any ref name,
+    causing every SHA to appear unreachable. The correct approach is to
+    list all refs and search the first column, mirroring the strategy
+    used by ``mpm install``'s ``_check_sha_reachable`` function.
+
+    This function is pure: no stdout/stderr side effects.
+
+    Args:
+        lockfile: A Lockfile dataclass instance.
+
+    Returns:
+        List of DoctorFinding instances with kind=error for each dangling SHA.
+    """
+    _policy = _read_retry_policy()
+
+    findings: list[DoctorFinding] = []
+    for source in lockfile.sources:
+        sha = source.resolved_sha
+
+        if _is_branch_revision(source.ref_spec):
+            continue
+
+        returncode, stdout, stderr = _run_ls_remote(
+            url=source.url,
+            ref="",
+            timeout=_policy.timeout,
+            retry_count=_policy.retry_count,
+            retry_delay=_policy.retry_delay,
+        )
+
+        if returncode != 0:
+            findings.append(
+                DoctorFinding(
+                    kind="error",
+                    code="DANGLING_SHA",
+                    message=(
+                        f"dangling SHA: {sha} is no longer reachable from {source.url}; "
+                        f"the remote may have force-pushed or pruned the commit."
+                    ),
+                    remediation="Run 'mpm install --refresh-lock' to rebuild.",
+                )
+            )
+            continue
+
+        sha_found = any(line.split("\t")[0] == sha for line in stdout.strip().splitlines() if "\t" in line)
+        if not sha_found:
+            findings.append(
+                DoctorFinding(
+                    kind="error",
+                    code="DANGLING_SHA",
+                    message=(
+                        f"dangling SHA: {sha} is no longer reachable from {source.url}; "
+                        f"the remote may have force-pushed or pruned the commit."
+                    ),
+                    remediation="Run 'mpm install --refresh-lock' to rebuild.",
+                )
+            )
+
+    return findings
+
+
+def _check_remote_reachability(
+    lockfile: "Lockfile",
+    ls_remote_callable: Callable[[str, str, int, int, float], tuple[int, str, str]],
+    retry_policy: RetryPolicy,
+) -> list[DoctorFinding]:
+    """Check that every distinct remote URL in the lockfile is reachable.
+
+    Subcheck 11 in spec Section 4.6: For each distinct canonicalized URL
+    recorded in the lockfile, run ``ls_remote_callable(url, 'HEAD', ...)``
+    subject to ``retry_policy``. A non-zero exit code from any call produces
+    a WARNING finding (not an error) including:
+    - The canonicalized URL.
+    - The exit code.
+    - The first line of stderr truncated at
+      ``MPM_DOCTOR_REMOTE_STDERR_PREVIEW_CHARS`` characters.
+    - A remediation hint referencing ``docs/git-auth-setup.md``.
+
+    Deduplication uses ``canonicalize_repo_url`` so that SSH and HTTPS forms
+    of the same repository are treated as one remote.
+
+    Auth-error patterns (``GIT_AUTH_ERROR_PATTERNS``) skip retries (enforced
+    inside ``ls_remote_callable``) but still produce a warning finding.
+
+    This function is pure: no stdout/stderr side effects.
+
+    Args:
+        lockfile: A Lockfile dataclass instance.
+        ls_remote_callable: Callable with signature
+            ``(url, ref, timeout, retry_count, retry_delay) -> (returncode, stdout, stderr)``.
+            Unit tests inject a stub; production wires ``_run_ls_remote_exit_code``.
+        retry_policy: Named tuple with timeout, retry_count, retry_delay fields.
+
+    Returns:
+        List of DoctorFinding instances with kind="warn" for each unreachable
+        remote URL. Empty list when all remotes are reachable.
+    """
+    from mpm_cli.core.url import canonicalize_repo_url
+
+    seen: dict[str, str] = {}
+    findings: list[DoctorFinding] = []
+    for source in lockfile.sources:
+        try:
+            canonical = canonicalize_repo_url(source.url)
+        except ValueError as exc:
+            findings.append(
+                DoctorFinding(
+                    kind="warn",
+                    code="REMOTE_URL_INVALID",
+                    message=f"lockfile source '{source.name}' has an unrecognized URL format: {source.url!r} ({exc})",
+                    remediation=(
+                        "Update the lockfile source URL to use https:// or git@ (SCP) format. "
+                        "See docs/git-auth-setup.md for supported URL schemes."
+                    ),
+                )
+            )
+            continue
+        if canonical not in seen:
+            seen[canonical] = source.url
+
+    for canonical_url, raw_url in seen.items():
+        returncode, _stdout, stderr = ls_remote_callable(
+            raw_url,
+            "HEAD",
+            retry_policy.timeout,
+            retry_policy.retry_count,
+            retry_policy.retry_delay,
+        )
+
+        if returncode == 0:
+            continue
+
+        first_stderr_line = stderr.splitlines()[0] if stderr.strip() else ""
+        stderr_preview = first_stderr_line[:MPM_DOCTOR_REMOTE_STDERR_PREVIEW_CHARS]
+
+        findings.append(
+            DoctorFinding(
+                kind="warn",
+                code="REMOTE_UNREACHABLE",
+                message=(
+                    f"remote unreachable: {canonical_url} "
+                    f"(exit code {returncode})" + (f"; stderr: {stderr_preview}" if stderr_preview else "")
+                ),
+                remediation=(
+                    f"Check network access and git credentials for {canonical_url}. "
+                    f"See docs/git-auth-setup.md for SSH key and credential helper setup."
+                ),
+            )
+        )
+
+    return findings
+
+
+def _check_effective_catalog_source(
+    args: argparse.Namespace,
+    env: dict[str, str],
+    lockfile: "Lockfile | None",
+) -> DoctorFinding:
+    """Resolve and report the effective catalog source with its provenance.
+
+    Implements subcheck 6 from spec Section 4.6: determines the effective
+    catalog source by walking the precedence chain (first non-empty wins):
+
+      1. ``--catalog-source`` CLI flag (highest precedence).
+      2. The single source configured in the ``MPM_CATALOG_SOURCES`` env var.
+      3. None (no catalog source configured).
+
+    ``MPM_CATALOG_SOURCES`` (plural, spec Section 6 / FR-9) is a
+    newline-delimited list; when it configures exactly one source that source is
+    the effective value, and when it configures several the finding reports the
+    ambiguity (single-source commands require ``--catalog-source`` to select one).
+
+    Schema v4 (spec Section 5.2 / FR-7) removed the lockfile ``[catalog]`` block,
+    so the lockfile no longer participates in catalog-source provenance.  The
+    catalog source for ``mpm add`` / ``mpm search`` / ``mpm outdated`` /
+    ``mpm why`` is supplied only by the CLI flag or the env var; ``mpm
+    install`` is hermetic and does not consult a catalog source at all.
+
+    This function is pure: it reads no global state directly. All inputs are
+    passed as parameters to enable unit testing without environment mutation.
+
+    The provenance suffix is mandatory in every output path -- without it an
+    operator can read the effective value but cannot tell WHERE it came from.
+    This is the primary mechanism for detecting ``MPM_CATALOG_SOURCES``
+    leakage from a shell profile into an unrelated workspace (spec Section 3.6).
+
+    Precedence disambiguation: ``args.catalog_source`` is set to the
+    ``_UNSET`` sentinel by the argparse default when the user did not supply
+    ``--catalog-source`` on the command line.  Any other value means the user
+    explicitly supplied the flag; that value is attributed to the CLI flag
+    regardless of whether the env var holds an identical string.
+
+    Args:
+        args: Parsed argument namespace. The ``catalog_source`` attribute is
+            the ``_UNSET`` sentinel when the CLI flag was not supplied, or the
+            user-supplied string when it was.
+        env: The process environment dict (pass ``dict(os.environ)`` or a test
+            substitute). Read-only: this function never mutates the dict.
+        lockfile: Optional Lockfile object. Accepted for call-site symmetry with
+            the other subchecks; the v4 lock carries no catalog source, so it does
+            not participate in the precedence chain.
+
+    Returns:
+        A DoctorFinding with kind="info" whose message contains both the
+        effective value and the provenance suffix.
+    """
+    raw_catalog_source = getattr(args, "catalog_source", _UNSET)
+    cli_value: str | None = None if raw_catalog_source is _UNSET else str(raw_catalog_source)
+    env_sources = parse_catalog_sources(env.get(CATALOG_SOURCES_ENV_VAR))
+
+    if cli_value is not None:
+        effective = cli_value
+        provenance = "(from --catalog-source CLI flag)"
+        message = f"Effective catalog source: {effective} {provenance}"
+    elif len(env_sources) == 1:
+        url, ref = env_sources[0]
+        effective = f"{url}@{ref}"
+        provenance = "(from MPM_CATALOG_SOURCES env var)"
+        message = f"Effective catalog source: {effective} {provenance}"
+    elif len(env_sources) > 1:
+        rendered = ", ".join(f"{url}@{ref}" for url, ref in env_sources)
+        provenance = "(from MPM_CATALOG_SOURCES env var)"
+        message = (
+            f"MPM_CATALOG_SOURCES configures {len(env_sources)} catalog sources "
+            f"({rendered}) {provenance}; single-source commands require "
+            "--catalog-source to select one."
+        )
+    else:
+        provenance = "(none configured)"
+        message = f"Effective catalog source: {provenance}; commands requiring a catalog source will fail."
+
+    return DoctorFinding(
+        kind="info",
+        code="EFFECTIVE_CATALOG_SOURCE",
+        message=message,
+        remediation="",
+    )
+
+
+def _check_completion_errors_report(
+    cache_dir: pathlib.Path,
+    limit: int,
+) -> DoctorFinding:
+    """Read recent entries from the completion-errors log and produce a finding.
+
+    Subcheck 7 in spec Section 4.6:
+    - If ``${cache_dir}/completion-errors.log`` is absent or empty, return an
+      info finding with code=NO_COMPLETION_ERRORS.
+    - If present and non-empty, return a warn finding whose message contains
+      the header "Recent completion errors (N):" followed by the last ``limit``
+      lines verbatim. N equals min(total_lines, limit).
+
+    This function is non-mutating: it never writes to, truncates, or rotates
+    the log file.
+
+    Args:
+        cache_dir: Directory where the completion-errors log is stored.
+            The resolved cache directory under the shared MPM_HOME root.
+        limit: Maximum number of recent log lines to include in the finding.
+
+    Returns:
+        A DoctorFinding with kind="info" when no errors are recorded, or
+        kind="warn" when recent errors exist.
+    """
+    log_file = cache_dir / MPM_COMPLETION_ERRORS_LOG_FILENAME
+
+    if not log_file.exists():
+        return DoctorFinding(
+            kind="info",
+            code="NO_COMPLETION_ERRORS",
+            message="no completion errors recorded",
+            remediation="",
+        )
+
+    content = log_file.read_text(encoding="utf-8")
+    lines = [line for line in content.splitlines() if line]
+
+    if not lines:
+        return DoctorFinding(
+            kind="info",
+            code="NO_COMPLETION_ERRORS",
+            message="no completion errors recorded",
+            remediation="",
+        )
+
+    recent = lines[-limit:]
+    count = len(recent)
+    body = "\n".join(recent)
+    message = f"Recent completion errors ({count}):\n{body}"
+
+    return DoctorFinding(
+        kind="warn",
+        code="COMPLETION_ERRORS",
+        message=message,
+        remediation=f"Inspect {log_file} for details.",
+    )
+
+
+def _check_completion_script_staleness(
+    search_paths: list[tuple[str, str]],
+    completion_generator: Callable[[str], str],
+) -> list[DoctorFinding]:
+    """Check static completion scripts for staleness against a fresh generation.
+
+    Subcheck 9 in spec Section 4.6: For each ``(shell, path)`` pair in
+    ``search_paths``, if the file exists on disk, compute its SHA-256 hash
+    and compare it to the SHA-256 hash of a freshly generated completion script
+    for that shell. When the hashes differ, a warn-level finding is emitted
+    naming the shell and the on-disk path.
+
+    Files that do not exist are silently skipped (no finding emitted).
+    In-sync files produce no finding.
+
+    Args:
+        search_paths: Sequence of (shell, path) pairs to inspect. Each path
+            is checked independently. Multiple pairs may share the same shell
+            name if the shell installs to multiple locations.
+        completion_generator: Callable that accepts a shell name (e.g. "bash"
+            or "zsh") and returns the completion script text for that shell.
+            No subprocess is spawned; this callable runs in-process.
+
+    Returns:
+        List of DoctorFinding instances with kind="warn" for each stale script.
+        Empty when no installed scripts are stale (or none are installed).
+    """
+    findings: list[DoctorFinding] = []
+
+    for shell, path_str in search_paths:
+        script_path = pathlib.Path(path_str)
+        if not script_path.exists():
+            continue
+
+        on_disk_content = script_path.read_text(encoding="utf-8")
+        on_disk_hash = hashlib.sha256(on_disk_content.encode("utf-8")).hexdigest()
+
+        fresh_content = completion_generator(shell)
+        fresh_hash = hashlib.sha256(fresh_content.encode("utf-8")).hexdigest()
+
+        if on_disk_hash != fresh_hash:
+            findings.append(
+                DoctorFinding(
+                    kind="warn",
+                    code="STALE_COMPLETION_SCRIPT",
+                    message=MPM_STALE_COMPLETION_SCRIPT_WARNING.format(
+                        shell_name=shell,
+                        path=path_str,
+                    ),
+                    remediation=f"mpm completion {shell} > {path_str}",
+                )
+            )
+
+    return findings
+
+
+def _print_finding(finding: DoctorFinding) -> None:
+    """Print a DoctorFinding to stderr.
+
+    Info-level findings are printed with prefix ``INFO:``, warnings with
+    ``WARN:``, and errors with ``ERROR:``. The remediation (if non-empty)
+    is appended on the next line, indented.
+
+    Args:
+        finding: The finding to print.
+    """
+    prefix_map = {"info": "INFO", "warn": "WARN", "error": "ERROR"}
+    prefix = prefix_map.get(finding.kind, "ERROR")
+    print(f"{prefix}: {finding.message}", file=sys.stderr)
+    if finding.remediation:
+        print(f"  Remediation: {finding.remediation}", file=sys.stderr)
+
+
+_FINDING_PREFIX_MAP: dict[str, str] = {
+    FINDING_SEVERITY_OK: FINDING_PREFIX_OK,
+    FINDING_SEVERITY_FAIL: FINDING_PREFIX_FAIL,
+    FINDING_SEVERITY_INFO: FINDING_PREFIX_INFO,
+}
+
+
+def _print_structured_finding(finding: Finding, quiet: bool = False) -> None:
+    """Print a structured Finding to stdout per the severity-to-prefix map.
+
+    Format:
+      - ok   -> "[ok] <name>"
+      - fail -> "[fail] <name>: <reason>"
+      - info -> "[info] <name>" or "[info] <name>: <reason>" when reason is set
+
+    When ``quiet`` is True, INFO-level findings are suppressed (not printed).
+
+    Args:
+        finding: The Finding to print.
+        quiet: When True, INFO-severity findings are suppressed.
+    """
+    if quiet and finding.severity == FINDING_SEVERITY_INFO:
+        return
+    prefix = _FINDING_PREFIX_MAP[finding.severity]
+    if finding.reason:
+        print(f"{prefix} {finding.name}: {finding.reason}")
+    else:
+        print(f"{prefix} {finding.name}")
+
+
+def _emit_subcheck_result(
+    subcheck_name: str,
+    doctor_findings: list[DoctorFinding],
+    quiet: bool,
+) -> bool:
+    """Emit the structured Finding for a multi-result subcheck and return whether errors exist.
+
+    Iterates the DoctorFinding list via _print_finding (for detailed diagnostics to
+    stderr), then emits a single structured Finding on stdout summarizing the outcome:
+      - Any error-level DoctorFinding -> Finding(fail, <name>, reason=<first error message>)
+      - No error-level DoctorFindings -> Finding(ok, <name>)
+
+    Args:
+        subcheck_name: The subcheck identifier constant (e.g. DOCTOR_SUBCHECK_ORPHAN_LOCKS).
+        doctor_findings: List of DoctorFinding objects returned by the subcheck handler.
+        quiet: Passed through to _print_structured_finding for INFO suppression.
+
+    Returns:
+        True if any error-level DoctorFinding was present; False otherwise.
+    """
+    first_error: DoctorFinding | None = None
+    for df in doctor_findings:
+        _print_finding(df)
+        if df.kind == "error" and first_error is None:
+            first_error = df
+    if first_error is not None:
+        _print_structured_finding(
+            Finding(
+                severity=FINDING_SEVERITY_FAIL,
+                name=subcheck_name,
+                reason=first_error.message,
+            ),
+            quiet=quiet,
+        )
+        return True
+    _print_structured_finding(
+        Finding(severity=FINDING_SEVERITY_OK, name=subcheck_name),
+        quiet=quiet,
+    )
+    return False
+
+
+def _run_completion_subchecks(
+    completion_generator: Callable[[str], str] | None,
+) -> None:
+    """Run completion subchecks 7 and 9, printing findings to stderr.
+
+    Subcheck 7 reads the completion-errors log from the resolved cache directory
+    (<MPM_HOME>/cache). Subcheck 9 checks static completion scripts for
+    staleness when a completion_generator is provided.
+
+    Both subchecks always run when invoked (no flag gates). This function
+    encapsulates their logic so both the normal and NO_LOCKFILE code paths
+    in doctor_command can call it without duplication.
+
+    Args:
+        completion_generator: Optional callable for subcheck 9. When None,
+            the staleness check is skipped.
+    """
+
+    errors_finding = _check_completion_errors_report(
+        resolve_cache_dir(),
+        limit=MPM_COMPLETION_ERRORS_REPORT_LIMIT,
+    )
+    _print_finding(errors_finding)
+
+    if completion_generator is not None:
+        staleness_findings = _check_completion_script_staleness(
+            search_paths=list(MPM_STATIC_COMPLETION_SEARCH_PATHS),
+            completion_generator=completion_generator,
+        )
+        for finding in staleness_findings:
+            _print_finding(finding)
+
+
+def doctor_command(
+    args: argparse.Namespace,
+    completion_generator: Callable[[str], str] | None = None,
+    now: Callable[[], datetime.datetime] | None = None,
+) -> int:
+    """Entry-point for 'mpm doctor' implementing subchecks 1-5, 7-11.
+
+    Orchestrates the consistency checks in order. Prints findings to
+    stderr via _print_finding. Returns exit code 0 unless at least one
+    finding with kind="error" is found.
+
+    Check 8 (--refresh-completion-cache) runs first when the flag is set.
+    Check 10 (--prune-cache) runs next when the flag is set.
+
+    Check 1 (mpm_hash / lockfile presence):
+    - .mpm absent: hard error, return immediately.
+    - .mpm.lock absent: info notice to stderr; skip checks 2-5 and 11;
+      return 0.
+
+    Checks 2-5 and 11 are only run when both files are present and the
+    hash is valid.
+
+    Check 7 always runs, reading the completion-errors log from the cache
+    directory resolved under the shared MPM_HOME root.
+
+    Check 9 runs when completion_generator is provided (not None).
+
+    Check 10 (--prune-cache) also emits an advisory for stale install
+    locks found under the cwd up to MPM_DOCTOR_STALE_LOCK_SCAN_MAX_DEPTH.
+
+    Check 11 runs for every distinct canonicalized remote URL recorded in
+    the lockfile. Findings are always warning-level (never error-level);
+    the command still exits 0 when only check 11 produces findings.
+
+    Args:
+        args: Parsed argument namespace from argparse. Expected attributes:
+            - mpm_file (str | None): path to .mpm file.
+            - lock_file (str | None): path to .mpm.lock file.
+            - strict_drift (bool): promote drift findings to errors.
+            - no_color (bool): suppress ANSI color (passed through from
+              global flags).
+            - refresh_completion_cache (bool): subcheck 8 flag.
+            - prune_cache (bool): subcheck 10 flag.
+        completion_generator: Optional callable accepting a shell name and
+            returning the completion script text for that shell. When
+            provided, subcheck 9 (static-script staleness) is executed.
+            When None, subcheck 9 is skipped.
+        now: Optional callable returning the current UTC datetime. When None,
+            defaults to ``datetime.datetime.now(tz=datetime.timezone.utc)``.
+            Tests inject a fixed value to avoid wall-clock dependencies.
+
+    Returns:
+        0 on success (no error-level findings); 1 when any error is found.
+    """
+    if now is None:
+
+        def now() -> datetime.datetime:
+            return datetime.datetime.now(tz=datetime.timezone.utc)
+
+    mpm_file_str: str | None = getattr(args, "mpm_file", None) or os.environ.get(MPM_MPM_FILE_ENV)
+    if mpm_file_str is None:
+        mpm_file_str = MPM_MPM_FILE_DEFAULT
+
+    lock_file_override: str | None = getattr(args, "lock_file", None) or os.environ.get(MPM_LOCK_FILE)
+
+    from mpm_cli.utils.lock_file_path import derive_lock_file_path
+
+    mpm_file = pathlib.Path(mpm_file_str)
+    lock_file = derive_lock_file_path(
+        mpm_file,
+        cli_lock_file=pathlib.Path(lock_file_override) if lock_file_override else None,
+        env_lock_file=os.environ.get(MPM_LOCK_FILE),
+    )
+
+    strict_drift: bool = getattr(args, "strict_drift", False)
+    do_refresh: bool = getattr(args, "refresh_completion_cache", False)
+    do_prune: bool = getattr(args, "prune_cache", False)
+
+    cache_dir: pathlib.Path = resolve_cache_dir()
+
+    if do_refresh:
+        completion_cache_dir = cache_dir / MPM_COMPLETION_CACHE_DIR
+        try:
+            removed = _refresh_completion_cache(completion_cache_dir)
+        except OSError as exc:
+            print(f"ERROR: Failed to refresh completion cache: {exc}", file=sys.stderr)
+            return 1
+        _print_finding(
+            DoctorFinding(
+                kind="info",
+                code="COMPLETION_CACHE_REFRESHED",
+                message=f"Completion cache refreshed: {removed} file(s) removed from {completion_cache_dir}",
+                remediation="",
+            )
+        )
+
+    if do_prune:
+        age_days = MPM_CACHE_PRUNE_AGE_DAYS
+        count_pruned, total_bytes = _prune_cache(cache_dir, age_days, now)
+        _print_finding(
+            DoctorFinding(
+                kind="info",
+                code="CACHE_PRUNED",
+                message=(
+                    f"Cache pruned: {count_pruned} file(s) removed "
+                    f"({total_bytes} bytes) with atime older than {age_days} days"
+                ),
+                remediation="",
+            )
+        )
+
+    if do_prune:
+        stale_locks = list(
+            _scan_stale_install_locks(
+                root=pathlib.Path.cwd(),
+                max_depth=MPM_DOCTOR_STALE_LOCK_SCAN_MAX_DEPTH,
+                age_hours=MPM_DOCTOR_STALE_LOCK_AGE_HOURS,
+                now=now,
+            )
+        )
+        for lock_path in stale_locks:
+            _print_finding(
+                DoctorFinding(
+                    kind="info",
+                    code="STALE_INSTALL_LOCK",
+                    message=(
+                        f"Advisory: stale install lock found at {lock_path} "
+                        f"(mtime older than {MPM_DOCTOR_STALE_LOCK_AGE_HOURS}h). "
+                        f"fcntl.flock self-cleans on process exit; this file is harmless."
+                    ),
+                    remediation="",
+                )
+            )
+
+    if not isinstance(args, argparse.Namespace):
+        raise DoctorArgsTypeError(type(args))
+    active_flag_names = {name for name, value in vars(args).items() if value is True}
+    if active_flag_names and active_flag_names.issubset(WORKSPACE_FREE_FLAGS):
+        return 0
+
+    quiet: bool = bool(getattr(args, "quiet", False))
+
+    consistency_finding = _check_mpm_hash(mpm_file, lock_file)
+
+    if consistency_finding is not None:
+        if consistency_finding.code == "NO_MPM":
+            _print_finding(consistency_finding)
+            _print_structured_finding(
+                Finding(
+                    severity=FINDING_SEVERITY_FAIL,
+                    name=DOCTOR_SUBCHECK_MPM_HASH,
+                    reason=consistency_finding.message,
+                ),
+                quiet=quiet,
+            )
+            return 1
+
+        if consistency_finding.code == "NO_LOCKFILE":
+            _print_finding(consistency_finding)
+
+            source_finding = _check_effective_catalog_source(args, dict(os.environ), None)
+            print(source_finding.message)
+            _run_completion_subchecks(completion_generator)
+            return 0
+
+        if consistency_finding.code == "HASH_MISMATCH":
+            _print_finding(consistency_finding)
+            _print_structured_finding(
+                Finding(
+                    severity=FINDING_SEVERITY_FAIL,
+                    name=DOCTOR_SUBCHECK_MPM_HASH,
+                    reason=consistency_finding.message,
+                ),
+                quiet=quiet,
+            )
+            return 1
+
+        if consistency_finding.code == "NO_SOURCES":
+            _print_finding(consistency_finding)
+            _print_structured_finding(
+                Finding(
+                    severity=FINDING_SEVERITY_FAIL,
+                    name=DOCTOR_SUBCHECK_MPM_HASH,
+                    reason=consistency_finding.message,
+                ),
+                quiet=quiet,
+            )
+            return 1
+
+    _print_structured_finding(
+        Finding(severity=FINDING_SEVERITY_OK, name=DOCTOR_SUBCHECK_MPM_HASH),
+        quiet=quiet,
+    )
+
+    from mpm_cli.core.lockfile import read_lockfile
+
+    lockfile = read_lockfile(lock_file)
+
+    has_errors = False
+
+    orphan_findings = _check_orphan_locks(mpm_file, lockfile)
+    if _emit_subcheck_result(DOCTOR_SUBCHECK_ORPHAN_LOCKS, orphan_findings, quiet):
+        has_errors = True
+
+    drift_findings = _check_branch_drift(lockfile, strict_drift=strict_drift)
+    if _emit_subcheck_result(DOCTOR_SUBCHECK_BRANCH_DRIFT, drift_findings, quiet):
+        has_errors = True
+
+    dangling_findings = _check_dangling_shas(lockfile)
+    for finding in dangling_findings:
+        _print_finding(finding)
+        if finding.kind == "error":
+            has_errors = True
+
+    remote_findings = _check_remote_reachability(
+        lockfile,
+        _run_ls_remote_exit_code,
+        _read_retry_policy(),
+    )
+    for finding in remote_findings:
+        _print_finding(finding)
+
+    source_finding = _check_effective_catalog_source(args, dict(os.environ), lockfile)
+    print(source_finding.message)
+
+    _run_completion_subchecks(completion_generator)
+
+    return 1 if has_errors else 0
+
+
+def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """Register the 'doctor' subcommand on the top-level argparse subparsers.
+
+    Adds the 'doctor' subparser with flags consumed by subchecks 1-5, 8, 10:
+    - ``--mpm-file``: path to .mpm (default MPM_MPM_FILE_DEFAULT).
+    - ``--lock-file``: path to .mpm.lock (default derived from --mpm-file).
+    - ``--strict-drift``: promote branch-drift findings to errors.
+    - ``--no-color``: suppress ANSI color output.
+    - ``--refresh-completion-cache``: subcheck 8 -- invalidate completion-cache subdir.
+    - ``--prune-cache``: subcheck 10 -- remove stale cache files by atime.
+
+    Args:
+        subparsers: The subparsers action from the top-level parser.
+    """
+    parser: argparse.ArgumentParser = subparsers.add_parser(
+        "doctor",
+        add_help=True,
+        help="Workspace health checks and cache management.",
+        description=(
+            "Run workspace health checks against the current project directory.\n\n"
+            "Subchecks:\n"
+            "  1. .mpm / .mpm.lock consistency via mpm_hash\n"
+            "  2. Hand-edit detection (mpm_hash mismatch)\n"
+            "  3. Orphaned lock entries\n"
+            "  4. Branch drift (use --strict-drift to promote to error)\n"
+            "  5. Dangling SHA detection\n"
+            "  8. Completion-cache invalidation (--refresh-completion-cache)\n"
+            " 10. Stale cache pruning + stale-lock advisory (--prune-cache)\n"
+            " 11. Remote reachability sanity check (warning only; exit 0)\n\n"
+            "With --refresh-completion-cache, invalidates the completion-cache subdir\n"
+            "under the MPM_HOME cache. With --prune-cache, removes cache files whose\n"
+            "atime exceeds MPM_CACHE_PRUNE_AGE_DAYS days and reports stale\n"
+            "install-lock files as an advisory (does not delete them).\n"
+            "Both flags are independent and may be combined."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--mpm-file",
+        dest="mpm_file",
+        default=None,
+        metavar="<path>",
+        help=(
+            f"Path to the .mpm file that identifies the workspace root. "
+            f"Defaults to '{MPM_MPM_FILE_DEFAULT}'. "
+            f"Overridden by the {MPM_MPM_FILE_ENV} environment variable; "
+            "the CLI flag takes precedence when both are set."
+        ),
+    )
+
+    parser.add_argument(
+        "--lock-file",
+        dest="lock_file",
+        default=None,
+        metavar="<path>",
+        help=(
+            "Path to the .mpm.lock lockfile. "
+            "Defaults to '<mpm-file>.lock' (e.g. ./.mpm.lock). "
+            f"Overridden by the {MPM_LOCK_FILE} environment variable."
+        ),
+    )
+
+    parser.add_argument(
+        "--strict-drift",
+        dest="strict_drift",
+        action="store_true",
+        default=False,
+        help=(
+            "Promote branch-drift findings from info-level to error-level. "
+            "With this flag, mpm doctor returns exit code 1 when any "
+            "branch-pinned source's tip SHA differs from the locked SHA."
+        ),
+    )
+
+    parser.add_argument(
+        "--refresh-completion-cache",
+        dest="refresh_completion_cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Subcheck 8: invalidate the shell completion cache under "
+            "<MPM_HOME>/cache/completion-cache/. "
+            "Removes all files there and recreates the directory with mode 0700. "
+            "Reports an info finding with the count of files removed."
+        ),
+    )
+
+    parser.add_argument(
+        "--prune-cache",
+        dest="prune_cache",
+        action="store_true",
+        default=False,
+        help=(
+            f"Subcheck 10: remove cache files under the MPM_HOME cache whose last-access "
+            f"time is older than MPM_CACHE_PRUNE_AGE_DAYS days (default {MPM_CACHE_PRUNE_AGE_DAYS}). "
+            "Reports an info finding with the count and total byte size pruned. "
+            "Also reports stale .mpm-data/.mpm-install.lock files as advisory "
+            "(does not delete them)."
+        ),
+    )
+
+    add_catalog_source_arg(parser)
+    parser.set_defaults(catalog_source=_UNSET)
+
+    parser.set_defaults(func=run_doctor)
+
+
+def run_doctor(args: argparse.Namespace) -> int:
+    """Entry-point function for the 'mpm doctor' subcommand.
+
+    Delegates to doctor_command, which handles all flags including
+    --refresh-completion-cache (subcheck 8) and --prune-cache (subcheck 10).
+
+    Args:
+        args: Parsed argument namespace from argparse.
+
+    Returns:
+        0 on success; non-zero on failure.
+    """
+    return doctor_command(args)
+
+
+def _refresh_completion_cache(cache_dir: pathlib.Path) -> int:
+    """Invalidate the completion-cache directory and return the count of files removed.
+
+    Removes the entire ``cache_dir`` tree (including any subdirectories), then
+    recreates the directory with mode ``0700``.
+
+    When ``cache_dir`` does not exist, it is created with mode ``0700`` and 0
+    is returned.
+
+    Args:
+        cache_dir: Path to the completion-cache directory to invalidate.
+            Typically ``<MPM_HOME>/cache/completion-cache``.
+
+    Returns:
+        The number of files that were removed.
+    """
+    if not cache_dir.exists():
+        cache_dir.mkdir(parents=True, mode=MPM_HOME_CACHE_DIR_MODE)
+        return 0
+
+    removed = sum(1 for child in cache_dir.rglob("*") if child.is_file())
+
+    shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, mode=MPM_HOME_CACHE_DIR_MODE)
+
+    return removed
+
+
+def _prune_cache(
+    cache_dir: pathlib.Path,
+    age_days: int,
+    now: Callable[[], datetime.datetime],
+) -> tuple[int, int]:
+    """Remove cache files whose atime is older than ``age_days`` days.
+
+    Walks all files under ``cache_dir`` recursively and removes those whose
+    atime falls before ``now() - timedelta(days=age_days)``.
+
+    When ``cache_dir`` does not exist, returns (0, 0) immediately.
+
+    Args:
+        cache_dir: Top-level cache directory to prune.
+        age_days: Files whose atime is older than this many days are removed.
+        now: Zero-argument callable returning the current datetime (with
+            timezone info). Injected so tests can pin time without relying on
+            wall-clock behaviour.
+
+    Returns:
+        A tuple ``(count_pruned, total_bytes)`` where ``count_pruned`` is the
+        number of files deleted and ``total_bytes`` is their combined size in
+        bytes.
+    """
+    if not cache_dir.exists():
+        return (0, 0)
+
+    cutoff = now() - datetime.timedelta(days=age_days)
+    count_pruned = 0
+    total_bytes = 0
+
+    for child in list(cache_dir.rglob("*")):
+        if not child.is_file():
+            continue
+        try:
+            file_stat = child.stat()
+        except OSError as exc:
+            print(f"WARN: Cannot stat {child}: {exc}", file=sys.stderr)
+            continue
+        atime = datetime.datetime.fromtimestamp(file_stat.st_atime, tz=datetime.timezone.utc)
+        if atime < cutoff:
+            try:
+                child.unlink()
+            except OSError as exc:
+                print(f"WARN: Cannot remove {child}: {exc}", file=sys.stderr)
+                continue
+            total_bytes += file_stat.st_size
+            count_pruned += 1
+
+    return (count_pruned, total_bytes)
+
+
+def _scan_stale_install_locks(
+    root: pathlib.Path,
+    max_depth: int,
+    age_hours: int,
+    now: Callable[[], datetime.datetime],
+) -> Iterator[pathlib.Path]:
+    """Yield paths of stale ``.mpm-data/.mpm-install.lock`` files.
+
+    Walks ``root`` up to ``max_depth`` directory levels deep looking for
+    ``<any-dir>/.mpm-data/.mpm-install.lock`` files whose mtime is older
+    than ``age_hours`` hours. Stale lock files are reported as advisory
+    findings; this function does NOT delete them.
+
+    Args:
+        root: Directory from which to start the scan. Typically the current
+            working directory.
+        max_depth: Maximum number of levels to descend below ``root``.
+            A value of 4 means root itself (depth 0) plus four more levels.
+        age_hours: Locks whose mtime is older than this many hours are stale.
+        now: Zero-argument callable returning the current datetime (with
+            timezone info). Injected so tests can pin time.
+
+    Yields:
+        Absolute Path of each stale lock file found.
+    """
+    cutoff = now() - datetime.timedelta(hours=age_hours)
+
+    def _walk(directory: pathlib.Path, current_depth: int) -> Iterator[pathlib.Path]:
+        """Recursively walk directory up to max_depth.
+
+        Args:
+            directory: Current directory being examined.
+            current_depth: Depth level from root (root == 0).
+
+        Yields:
+            Stale lock file paths.
+        """
+        candidate = directory / ".mpm-data" / INSTALL_LOCK_FILENAME
+        if candidate.is_file():
+            try:
+                mtime = datetime.datetime.fromtimestamp(candidate.stat().st_mtime, tz=datetime.timezone.utc)
+                if mtime < cutoff:
+                    yield candidate
+            except OSError as exc:
+                print(f"WARN: Cannot stat {candidate}: {exc}", file=sys.stderr)
+
+        if current_depth >= max_depth:
+            return
+
+        try:
+            children = list(directory.iterdir())
+        except OSError as exc:
+            print(f"WARN: Cannot list {directory}: {exc}", file=sys.stderr)
+            return
+
+        for child in children:
+            if child.is_dir():
+                yield from _walk(child, current_depth + 1)
+
+    yield from _walk(root, 0)

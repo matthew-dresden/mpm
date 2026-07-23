@@ -1,0 +1,203 @@
+"""Scenario tests: npm-like ``mpm install`` reconcile (RC family).
+
+Mirrors ``docs/integration-testing.md`` family ``RC-NN``.  Exercises the operator
+path -- subprocess ``mpm install`` against local ``file://`` fixtures (no
+network) -- for the reconcile contract introduced to fix the
+``install-orphan-rescue-crash-and-lock-corruption`` bug:
+
+- RC-01: ``remove A + add B`` -- a plain ``mpm install`` fails fast on the drift
+  (exit 1, no ``BUG:``, lock unmutated); ``mpm install --reconcile`` reconciles
+  npm-style (lock = the new source set, no internal ``BUG:`` and no traceback) and
+  a second plain install is idempotent (CONSISTENT replay, lock byte-stable).
+- RC-02: ``mpm install --strict-lock`` (npm ci) errors cleanly on drift WITHOUT
+  mutating the lockfile (read the lock bytes before/after; assert equal).
+
+Fixture builders are reused from ``test_lockfile_lifecycle`` (single source of
+truth).  ``MPM_ALLOW_INSECURE_REMOTES=1`` is set per-run for ``file://`` URLs.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import subprocess
+import sys
+
+import pytest
+
+from mpm_cli.core.lockfile import read_lockfile
+from tests.scenarios.test_lockfile_lifecycle import (
+    _build_manifest_repo_with_tags,
+    _run_install,
+)
+from tests.scenarios.conftest import make_bare_repo_with_tags
+
+
+def _run_install_reconcile(project_dir: pathlib.Path) -> subprocess.CompletedProcess:
+    """Invoke ``mpm install --reconcile`` as a subprocess against ``file://`` fixtures.
+
+    The lenient npm-install reconcile (prune orphans, re-resolve added/changed
+    sources, replay the rest) is opt-in via ``--reconcile``; a plain
+    ``mpm install`` on a drifted lock instead fails fast without mutating it.
+    ``MPM_ALLOW_INSECURE_REMOTES=1`` lets the ``file://`` fixture URLs pass the
+    HTTPS gate, and ``MPM_CATALOG_SOURCE`` is scrubbed because install is
+    hermetic.
+
+    Args:
+        project_dir: Working directory for the subprocess.
+
+    Returns:
+        The completed subprocess result.
+    """
+    cmd = [sys.executable, "-m", "mpm_cli", "install", "--reconcile"]
+    env = {
+        **os.environ,
+        "MPM_ALLOW_INSECURE_REMOTES": "1",
+    }
+    env.pop("MPM_CATALOG_SOURCE", None)
+    return subprocess.run(
+        cmd,
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+def _write_mpm_two_optional(
+    project_dir: pathlib.Path,
+    sources: list[tuple[str, str, str]],
+) -> pathlib.Path:
+    """Write a ``.mpm`` declaring the given ``(name, manifest_url, revision)`` sources.
+
+    Args:
+        project_dir: Directory where ``.mpm`` is written.
+        sources: List of ``(source_name, manifest_url, revision_spec)`` tuples.
+
+    Returns:
+        Path to the written ``.mpm`` file.
+    """
+    lines = [
+        "GITBASE=https://unused.example.com",
+        f"CLAUDE_MARKETPLACES_DIR={project_dir / 'mpm-test-mktplc'}",
+        "MPM_MARKETPLACE_INSTALL=false",
+    ]
+    for name, url, revision in sources:
+        lines.append(f"MPM_SOURCE_{name}_URL={url}")
+        lines.append(f"MPM_SOURCE_{name}_REF={revision}")
+        lines.append(f"MPM_SOURCE_{name}_PATH=manifest.xml")
+        lines.append(f"MPM_SOURCE_{name}_NAME={name}")
+        lines.append(f"MPM_SOURCE_{name}_GITBASE={url}")
+    mpm_path = project_dir / ".mpm"
+    mpm_path.write_text("\n".join(lines) + "\n")
+    mpm_path.chmod(0o600)
+    return mpm_path
+
+
+def _build_source(fixtures: pathlib.Path, label: str) -> str:
+    """Build a content+manifest fixture for ``label`` and return its manifest ``file://`` URL."""
+    content_dir = fixtures / f"{label}-content"
+    content_dir.mkdir()
+    make_bare_repo_with_tags(content_dir, f"{label}-content", ["1.0.0"])
+    manifest_bare, _content_fetch_url = _build_manifest_repo_with_tags(
+        fixtures,
+        label,
+        ["1.0.0"],
+        content_dir,
+    )
+    return manifest_bare.as_uri()
+
+
+@pytest.mark.scenario
+class TestRcReconcile:
+    """RC family: npm-like reconcile and strict-lock-on-drift scenarios."""
+
+    def test_rc_01_remove_add_reconciles_and_is_idempotent(self, tmp_path: pathlib.Path) -> None:
+        """RC-01: remove A + add B; plain install fails fast, --reconcile reconciles to B, then idempotent.
+
+        Reproduces the wedged-workspace bug scenario at the operator boundary:
+        the lockfile has A (an orphan after removal) while ``.mpm`` declares only
+        B (a new source).  A plain ``mpm install`` now fails fast on this drift
+        (exit 1) without mutating the lock; ``mpm install --reconcile`` must prune
+        A, resolve B fresh, write a valid lock = {B}, and never emit an internal
+        ``BUG:`` or a traceback.  A second plain install (now CONSISTENT) must be
+        idempotent (replay, byte-stable lockfile).
+        """
+        fixtures = tmp_path / "fixtures"
+        fixtures.mkdir()
+        project = tmp_path / "project"
+        project.mkdir()
+
+        url_a = _build_source(fixtures, "alpha")
+        url_b = _build_source(fixtures, "beta")
+        lock_path = project / ".mpm.lock"
+
+        _write_mpm_two_optional(project, [("ALPHA", url_a, "==1.0.0")])
+        r1 = _run_install(project)
+        assert r1.returncode == 0, f"initial install failed:\nstdout={r1.stdout!r}\nstderr={r1.stderr!r}"
+        assert sorted(e.name for e in read_lockfile(lock_path).sources) == ["ALPHA"]
+        lock_before_drift = lock_path.read_bytes()
+
+        _write_mpm_two_optional(project, [("BETA", url_b, "==1.0.0")])
+        r2 = _run_install(project)
+        assert r2.returncode != 0, (
+            f"plain install on a drifted lock must fail fast:\nstdout={r2.stdout!r}\nstderr={r2.stderr!r}"
+        )
+        assert "BUG:" not in r2.stdout and "BUG:" not in r2.stderr, (
+            f"the drift error must never emit an internal BUG: line.\nstdout={r2.stdout!r}\nstderr={r2.stderr!r}"
+        )
+        assert "Traceback" not in r2.stderr, f"the drift error must not raise a traceback.\nstderr={r2.stderr!r}"
+        assert lock_path.read_bytes() == lock_before_drift, (
+            "a plain install that fails fast on drift must NOT mutate the lockfile"
+        )
+
+        r3 = _run_install_reconcile(project)
+        assert r3.returncode == 0, (
+            f"reconcile install must succeed (no BUG/traceback):\nstdout={r3.stdout!r}\nstderr={r3.stderr!r}"
+        )
+        assert "BUG:" not in r3.stdout and "BUG:" not in r3.stderr, (
+            f"reconcile must never emit an internal BUG: line.\nstdout={r3.stdout!r}\nstderr={r3.stderr!r}"
+        )
+        assert "Traceback" not in r3.stderr, f"reconcile must not raise a traceback.\nstderr={r3.stderr!r}"
+        assert sorted(e.name for e in read_lockfile(lock_path).sources) == ["BETA"], (
+            "reconcile must drop the orphaned ALPHA entry and add the new BETA entry"
+        )
+        lock_after_reconcile = lock_path.read_bytes()
+
+        r4 = _run_install(project)
+        assert r4.returncode == 0, f"second install failed:\nstdout={r4.stdout!r}\nstderr={r4.stderr!r}"
+        assert lock_path.read_bytes() == lock_after_reconcile, (
+            "second plain install must be idempotent (CONSISTENT replay); lockfile must not change"
+        )
+
+    def test_rc_02_strict_lock_errors_on_drift_without_mutating(self, tmp_path: pathlib.Path) -> None:
+        """RC-02: --strict-lock errors on drift and leaves the lockfile byte-for-byte unchanged.
+
+        Builds a lock = {ALPHA}, then drifts ``.mpm`` to remove ALPHA and add BETA
+        (orphan + addition).  ``mpm install --strict-lock`` must exit non-zero with
+        a clean error (no internal ``BUG:``/no traceback) and the lockfile on disk
+        must be identical before and after.
+        """
+        fixtures = tmp_path / "fixtures"
+        fixtures.mkdir()
+        project = tmp_path / "project"
+        project.mkdir()
+
+        url_a = _build_source(fixtures, "alpha")
+        url_b = _build_source(fixtures, "beta")
+        lock_path = project / ".mpm.lock"
+
+        _write_mpm_two_optional(project, [("ALPHA", url_a, "==1.0.0")])
+        r1 = _run_install(project)
+        assert r1.returncode == 0, f"initial install failed:\nstdout={r1.stdout!r}\nstderr={r1.stderr!r}"
+        lock_before = lock_path.read_bytes()
+
+        _write_mpm_two_optional(project, [("BETA", url_b, "==1.0.0")])
+
+        r2 = _run_install(project, strict_lock=True)
+        assert r2.returncode != 0, f"--strict-lock must error on drift.\nstdout={r2.stdout!r}\nstderr={r2.stderr!r}"
+        combined = r2.stdout + r2.stderr
+        assert "BUG:" not in combined, f"--strict-lock must not emit an internal BUG: line.\n{combined!r}"
+        assert "Traceback" not in r2.stderr, f"--strict-lock must not raise a traceback.\nstderr={r2.stderr!r}"
+        assert lock_path.read_bytes() == lock_before, "--strict-lock must NEVER mutate the lockfile on drift"

@@ -1,0 +1,612 @@
+# mpm outdated and why
+
+Operator-facing reference for two read-only inspection commands:
+`mpm outdated` and `mpm why`.
+
+For first-time setup see
+[docs/setup-guide.md](setup-guide.md).
+For the canonical environment-variable table see
+[docs/configuration.md](configuration.md).
+For the lockfile format that both commands read see
+[docs/lockfile.md](lockfile.md).
+
+---
+
+## mpm outdated
+
+Report installable upgrades per source.
+
+### outdated -- Synopsis
+
+```text
+mpm outdated [--catalog-source <git-url>@<ref>]
+               [--mpm-file <path>]
+               [--lock-file <path>]
+               [--format {table,json}]
+               [--fail-on-upgrade]
+               [--no-color]
+```
+
+### outdated -- How it works
+
+`mpm outdated` resolves the catalog identified by `--catalog-source`
+(or `MPM_CATALOG_SOURCES`), then reads every
+`MPM_SOURCE_<name>_*` block from the `.mpm` file and compares the
+currently-installed version against what the catalog now offers.
+
+Steps:
+
+1. Resolve the catalog source (required -- no lockfile fallback for
+   this command; see [docs/configuration.md](configuration.md) for
+   the `MPM_CATALOG_SOURCES` env var).
+2. Read the `.mpm` file.
+3. For each source block:
+   - Determine the **current** resolved version from `.mpm.lock`
+     when present; otherwise live-resolve against the catalog.
+   - Determine **latest-matching-spec**: the highest version that
+     still satisfies the PEP 440 constraint recorded in the source
+     block.
+   - Determine **latest-available**: the highest version that exists
+     in the catalog regardless of the recorded constraint (shows the
+     "relaxed upgrade" ceiling).
+4. Emit one output row per source.
+
+### outdated -- Flags
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--catalog-source <url>@<ref>` | env | Catalog source. |
+| `--mpm-file <path>` | `./.mpm` | Declaration file. |
+| `--lock-file <path>` | derived | Lockfile path. |
+| `--format {table,json}` | `table` | Output format. |
+| `--fail-on-upgrade` | off | Exit 1 on upgrade. |
+| `--no-color` | auto | Disable ANSI color. |
+
+Environment variable overrides: `--catalog-source` =
+`MPM_CATALOG_SOURCES`, `--mpm-file` = `MPM_MPM_FILE`,
+`--lock-file` = `MPM_LOCK_FILE`, `--format` =
+`MPM_OUTDATED_FORMAT`. See
+[docs/configuration.md](configuration.md) for details.
+
+### outdated -- Exit codes
+
+| Condition | Exit code |
+| --------- | --------- |
+| Completed normally, no upgrades available | `0` |
+| Completed normally, upgrades available (default) | `0` |
+| Upgrades available, `--fail-on-upgrade` passed | `1` |
+| Catalog source not configured | `1` |
+| `.mpm` file not found | `1` |
+| Manifest repo contains zero PEP 440-parseable tags | `1` |
+| Any unhandled error | `1` |
+
+See [docs/exit-codes.md](exit-codes.md) for the full exit-code table.
+
+The default exit-0 design follows the convention of `pip list
+--outdated`, `npm outdated`, and `cargo outdated`: the report is
+informational and does not block downstream pipeline steps unless the
+operator opts in with `--fail-on-upgrade`.
+
+### outdated -- Output format: table (default)
+
+The table is preceded by one alias-render line per source
+(`<alias> -> <source-name> from <url>@<ref>`); columns are joined with ` | `
+and the separator row uses `-+-`:
+
+```text
+$ mpm outdated \
+    --catalog-source \
+    https://example.com/org/manifest-repo.git@main
+
+package-a -> package_a from https://example.com/org/manifest-repo.git@~=1.2.0
+package-b -> package_b from https://example.com/org/manifest-repo.git@==3.0.0
+package-c -> package_c from https://example.com/org/manifest-repo.git@main
+name      | current      | latest-matching-spec | latest-available | upgrade-type
+----------+--------------+----------------------+------------------+-------------
+package-a | 1.2.0        | 1.2.1                | 2.0.0            | patch
+package-b | 3.0.0        | 3.0.0                | 3.1.0            | none
+package-c | a1b2c3d4e5f6 | f6e5d4c3b2a1         | f6e5d4c3b2a1     | drift
+```
+
+Column definitions:
+
+| Column | Description |
+| ------ | ----------- |
+| `name` | Source name (normalized alias) from `MPM_SOURCE_<alias>_*`. |
+| `current` | Version or 12-char SHA currently in `.mpm.lock`. |
+| `latest-matching-spec` | Highest version satisfying the PEP 440 constraint. |
+| `latest-available` | Highest version ignoring the constraint. |
+| `upgrade-type` | One of `none`, `patch`, `minor`, `major`, or `drift`. |
+
+### outdated -- Branch-pinned source drift column
+
+When a source's `MPM_SOURCE_<alias>_REF` value is a branch name (e.g.,
+`main`, `develop`) rather than a PEP 440 tag, version comparison is not
+applicable. Instead:
+
+- Both `latest-matching-spec` and `latest-available` display the current HEAD
+  SHA of that branch, truncated to 12 characters.
+- `upgrade-type` reads `drift` when the SHA in `.mpm.lock` differs from the
+  branch HEAD.
+- `upgrade-type` reads `none` when the locked SHA matches the branch HEAD.
+
+Example -- `package-c` has drifted from the locked commit:
+
+```text
+name      | current      | latest-matching-spec | latest-available | upgrade-type
+----------+--------------+----------------------+------------------+-------------
+package-c | a1b2c3d4e5f6 | f6e5d4c3b2a1         | f6e5d4c3b2a1     | drift
+```
+
+Operators who want deterministic installs should switch branch-pinned
+sources to tag-based pinning with a PEP 440 constraint.
+
+### outdated -- Output format: --format json
+
+The JSON payload is a top-level object with two keys: `aliases` (the
+alias-render strings) and `sources` (one object per source). Each source
+object has exactly five hyphenated string keys:
+
+```json
+{
+  "aliases": [
+    "package-a -> package_a from https://example.com/org/manifest-repo.git@~=1.2.0",
+    "package-b -> package_b from https://example.com/org/manifest-repo.git@==3.0.0",
+    "package-c -> package_c from https://example.com/org/manifest-repo.git@main"
+  ],
+  "sources": [
+    {
+      "name": "package-a",
+      "current": "1.2.0",
+      "latest-matching-spec": "1.2.1",
+      "latest-available": "2.0.0",
+      "upgrade-type": "patch"
+    },
+    {
+      "name": "package-b",
+      "current": "3.0.0",
+      "latest-matching-spec": "3.0.0",
+      "latest-available": "3.1.0",
+      "upgrade-type": "none"
+    },
+    {
+      "name": "package-c",
+      "current": "a1b2c3d4e5f6",
+      "latest-matching-spec": "f6e5d4c3b2a1",
+      "latest-available": "f6e5d4c3b2a1",
+      "upgrade-type": "drift"
+    }
+  ]
+}
+```
+
+### outdated -- Error scenarios
+
+#### Missing catalog source
+
+```text
+ERROR: mpm outdated requires a catalog source.
+Provide one of:
+  --catalog-source <git-url>@<ref>       # e.g. --catalog-source https://example.com/org/manifest-repo.git@main
+  MPM_CATALOG_SOURCES=<git-url>@<ref>  # set as env var (one entry per line), then re-run
+
+The CLI flag takes precedence when both are set.
+A catalog source identifies a manifest repo (a git repository whose
+repo-specs/ directory exposes installable mpm dependencies).
+See docs/catalogs-explained.md for what a manifest repo is and how to find one.
+See docs/configuration.md for the full configuration reference.
+```
+
+#### Manifest repo with no PEP 440 tags
+
+When a tag-pinned source resolves against a manifest repo whose tags all have
+a last path component that is not a valid PEP 440 version (e.g., `v1.0.0`,
+`release-2024`), the version resolver raises a loud error. `mpm outdated`
+prints it to stderr and exits non-zero immediately on that source (before the
+table is printed):
+
+```text
+ERROR: No PEP 440-parseable version tags found under '<prefix>'.
+Skipped 2 tag(s) whose last path component is not a valid PEP 440 version:
+  - refs/tags/release-2024
+  - refs/tags/v1.0.0
+Run 'mpm catalog audit --check tag-format' against the manifest repo
+to identify every non-PEP-440 tag, then ask the catalog author to rename
+them to PEP 440 form (e.g., 'release-1.0.0' -> '1.0.0').
+```
+
+---
+
+## mpm why
+
+Explain why a package, XML manifest, or source is present in the
+resolved dependency tree.
+
+### why -- Synopsis
+
+```text
+mpm why <name-or-url> [--mpm-file <path>]
+          [--lock-file <path>]
+          [--catalog-source <git-url>@<ref>]
+          [--format {text,json}]
+          [--no-color]
+```
+
+### why -- How it works
+
+`mpm why` reads `.mpm` (and `.mpm.lock` when present) to build
+the full resolved dependency tree, then traces every chain that ends at
+the node identified by `<name-or-url>`. It resolves the tree from the
+lockfile when available; a live catalog source is required only when no
+lockfile exists.
+
+### why -- Accepted argument shapes
+
+The single positional argument is matched in the following precedence:
+
+| Shape | Example |
+| ----- | ------- |
+| Project URL | `https://example.com/org/manifest-repo.git` |
+| Source URL | `https://example.com/org/catalog-repo.git` |
+| Root manifest path | `repo-specs/package-a-marketplace.xml` |
+| Transitive XML manifest path | `repo-specs/network/remote.xml` |
+| Transitive include name | `remote` |
+| Entry name | `package-a` |
+| Source name | `package_a` |
+
+Notes:
+
+- Project URLs and source URLs are canonicalized via `canonicalize_repo_url`
+  before matching, so `http://` vs `https://` and trailing `.git` differences
+  are normalized.
+- Both the entry-name form (`package-a`) and the normalized source-name
+  form (`package_a`) are accepted for top-level sources.
+- **Source URL** -- the git URL of the manifest repo itself (i.e.
+  `MPM_SOURCE_<name>_URL`) -- resolves to the owning source chain.
+- **Root manifest path** -- the `MPM_SOURCE_<name>_PATH` value (e.g.
+  `repo-specs/package-a-marketplace.xml`) -- resolves to the owning source
+  on the live-resolve path.
+- **Transitive include name** -- the `name` of an `<include>` node, normalized
+  via `derive_source_name`, resolves to that include wherever it appears in the
+  tree (queryable interchangeably with its manifest path).
+- Matched nodes are grouped by logical identity. When a single logical node is
+  reached by many chains (for example a transitive include pulled in by several
+  sources), every chain is printed. An ambiguity error is raised only when the
+  argument matches two or more **distinct** interpretations (different kinds, or
+  different logical nodes).
+
+### why -- Placeholder fetch URLs on the live-resolve path
+
+When no `.mpm.lock` is present (`mpm why` operates in live-resolve mode),
+the manifest XML may declare a remote fetch URL using a `${VAR}` placeholder,
+for example `<remote name="pkgs" fetch="${GITBASE}">`.  `mpm why` resolves
+these placeholders from the `.mpm` globals (the non-source, non-special
+`KEY=VALUE` pairs written by `mpm add`, such as `GITBASE=https://github.com/org`).
+
+This substitution uses `os.path.expandvars` -- the same primitive that
+`mpm repo envsubst` uses -- applied before URL canonicalization.
+
+If a `${VAR}` placeholder is declared in the manifest but the matching
+variable is absent from the `.mpm` globals, `mpm why` exits with an
+actionable error naming the missing variable and the `.mpm` file path.
+
+Using a concrete `fetch` URL (no placeholder) remains fully supported -- the
+substitution step is skipped for fetch values that contain no `${...}` patterns.
+
+### why -- Match annotation
+
+Before printing any chain, `mpm why` emits a one-line annotation
+confirming the matched category and the queried token:
+
+```text
+matched url 'https://example.com/org/manifest-repo.git'
+```
+
+The annotation form differs by query type:
+
+| Query form | Annotation example |
+| ---------- | ------------------ |
+| Project URL | `matched url 'https://example.com/org/proj.git'` |
+| Source URL | `matched url 'https://example.com/org/catalog.git'` |
+| Root manifest path | `matched xml_path 'repo-specs/package-a-marketplace.xml'` |
+| Transitive XML path | `matched xml_path 'repo-specs/network/remote.xml'` |
+| Source name | `matched source_name 'package_a'` |
+| Transitive include name | `matched include_name 'remote'` |
+
+The annotation is emitted on the first output line. The chain line(s)
+follow unchanged. The annotation is omitted on error paths (miss,
+ambiguity).
+
+### why -- Chain walking
+
+For every matching node, `mpm why` prints all resolution chains that
+lead to it after the match annotation. A chain walks the `<include>`
+graph from a top-level source entry down to the requested node:
+
+```text
+$ mpm why https://example.com/org/manifest-repo.git \
+    --catalog-source \
+    https://example.com/org/manifest-repo.git@main
+
+matched url 'https://example.com/org/manifest-repo.git'
+package-a -> repo-specs/base.xml@a1b2c3d4e5f6 \
+    -> repo-specs/network/remote.xml@b2c3d4e5f6a1 \
+    -> https://example.com/org/manifest-repo.git@c3d4e5f6a1b2
+```
+
+Each node in the chain is annotated with its resolved SHA.
+
+When the requested node is reached by multiple chains -- for example a
+transitive include pulled in by several top-level sources, or a diamond in the
+include graph -- every chain is printed under the single match annotation.
+
+### why -- Cycle detection
+
+If the transitive include graph contains a cycle (e.g., `A.xml`
+includes `B.xml` which includes `A.xml`), `mpm why` exits with a
+hard error before printing any output:
+
+```text
+ERROR: include cycle detected:
+  repo-specs/base.xml -> repo-specs/ext.xml -> repo-specs/base.xml
+Remove the cycle from the manifest repo and re-run.
+```
+
+### why -- Diamond deduplication
+
+When two separate `<include>` paths both resolve to the same XML
+manifest, the manifest is processed once. Both chains are shown in the
+output, but the manifest itself is not duplicated in the resolution
+tree:
+
+```text
+package-a -> repo-specs/base.xml@a1b2c3d4e5f6 \
+    -> repo-specs/shared.xml@d4e5f6a1b2c3
+package-a -> repo-specs/extra.xml@e5f6a1b2c3d4 \
+    -> repo-specs/shared.xml@d4e5f6a1b2c3
+```
+
+### why -- Ambiguity behaviour
+
+`mpm why` raises an ambiguity error only when the argument matches two or
+more **distinct** interpretations -- different kinds (for example a string that
+is both a valid source name and a valid XML path), or different logical nodes.
+The same logical node reached by many chains is **not** an ambiguity; all of its
+chains are printed. On a genuine ambiguity the command exits non-zero, listing
+each distinct interpretation:
+
+```text
+ERROR: argument 'shared' is ambiguous: it matches 2 distinct interpretations:
+  source name: shared
+  XML manifest path: repo-specs/shared.xml
+Disambiguate by passing one of the exact tokens above.
+```
+
+### why -- Not-found behaviour
+
+If the argument matches nothing in the resolved tree, `mpm why` exits
+with a hard error. When candidates exist within edit distance 3
+(Levenshtein), up to 3 closest matches are suggested:
+
+```text
+$ mpm why pacakge-a \
+    --catalog-source \
+    https://example.com/org/manifest-repo.git@main
+
+ERROR: 'pacakge-a' not found in the resolved dependency tree.
+Did you mean one of:
+  package-a  (edit distance 2)
+  package-b  (edit distance 3)
+```
+
+When no candidates are within the threshold, the error omits the
+suggestion block:
+
+```text
+ERROR: 'zzz-unknown' not found in the resolved dependency tree.
+```
+
+The suggestion threshold and maximum number of suggestions are
+configurable via environment variables; see
+[docs/configuration.md](configuration.md) for
+`MPM_WHY_SUGGEST_MAX_DISTANCE` and `MPM_WHY_SUGGEST_TOP_N`.
+
+### why -- Flags
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--catalog-source <url>@<ref>` | env | Required when no lockfile. |
+| `--mpm-file <path>` | `./.mpm` | Declaration file. |
+| `--lock-file <path>` | derived | Lockfile path. |
+| `--format {text,json}` | `text` | Output format. |
+| `--no-color` | auto | Disable ANSI color. |
+
+Environment variable overrides: `--catalog-source` =
+`MPM_CATALOG_SOURCES`, `--mpm-file` = `MPM_MPM_FILE`,
+`--lock-file` = `MPM_LOCK_FILE`, `--format` = `MPM_WHY_FORMAT`.
+See [docs/configuration.md](configuration.md) for details.
+
+### why -- Output format: --format json
+
+With `--format json`, the output is a top-level JSON object with two
+keys: `matched` (the match annotation) and `chains` (the chain data).
+
+```json
+{
+  "matched": {
+    "category": "url",
+    "token": "https://example.com/org/manifest-repo.git"
+  },
+  "chains": [
+    [
+      {
+        "kind": "source",
+        "name": "package-a",
+        "ref": null,
+        "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "url": "https://example.com/org/catalog-repo.git"
+      },
+      {
+        "kind": "include",
+        "name": "repo-specs/base.xml",
+        "ref": "repo-specs/base.xml",
+        "sha": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+        "url": null
+      },
+      {
+        "kind": "project",
+        "name": "remote-lib",
+        "ref": null,
+        "sha": "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+        "url": "https://example.com/org/manifest-repo.git"
+      }
+    ]
+  ]
+}
+```
+
+`matched` object fields:
+
+| Field | Description |
+| ----- | ----------- |
+| `category` | One of `url`, `xml_path`, `source_name`. |
+| `token` | The exact matched token (URL, XML path, or source name). |
+
+`matched.category` values by query form:
+
+| Query form | `category` value |
+| ---------- | ---------------- |
+| Project or source URL | `url` |
+| Root or transitive XML manifest path | `xml_path` |
+| Source name | `source_name` |
+
+Node `kind` values in `chains`:
+
+| Value | Description |
+| ----- | ----------- |
+| `source` | A top-level `MPM_SOURCE_<name>_*` entry from `.mpm`. |
+| `include` | A transitive `<include>` XML manifest file. |
+| `project` | A `<project>` package repo entry in an XML manifest. |
+
+Each node has exactly five fields: `kind`, `name`, `ref`, `sha`, `url`.
+`ref` is the XML path for include nodes and `null` for source and
+project nodes. `url` is the canonical HTTPS URL for project and source
+nodes and `null` for include nodes.
+
+JSON indentation defaults to 2 spaces. Configure via
+`MPM_WHY_JSON_INDENT` (see
+[docs/configuration.md](configuration.md)).
+
+---
+
+## CI integration patterns
+
+Both commands integrate naturally into automated pipelines. The typical
+pattern is to run `mpm outdated --fail-on-upgrade` on a schedule and
+take action (open a ticket, fail a PR gate) when upgrades are
+available.
+
+### GitHub Actions
+
+The following workflow runs a nightly check and opens a GitHub issue
+when upgrades are found. The `mpm outdated --format json` output is
+captured for the issue body.
+
+```yaml
+name: dependency-drift
+
+on:
+  schedule:
+    # Run at 06:00 UTC every day
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check-outdated:
+    runs-on: ubuntu-latest
+    env:
+      MPM_CATALOG_SOURCES: >-
+        https://example.com/org/manifest-repo.git@main
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mpm
+        run: pip install mpm
+
+      - name: Check for upgrades
+        id: outdated
+        # Exit 1 when upgrades are available; capture for issue body
+        run: |
+          set +e
+          mpm outdated --fail-on-upgrade --format json \
+            > outdated.json 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue on drift
+        if: steps.outdated.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "mpm: upgrades available ($(date -u +%Y-%m-%d))" \
+            --body "$(cat outdated.json)" \
+            --label "dependencies"
+```
+
+Key points:
+
+- `MPM_CATALOG_SOURCES` is set as a job-level env var so all steps
+  inherit it without repeating the flag.
+- `set +e` prevents the shell from exiting before `$GITHUB_OUTPUT` is
+  written.
+- The `--format json` output is machine-readable and suitable as an
+  issue or PR description body.
+
+### Generic shell CI
+
+For CI systems without a native YAML DSL (Jenkins, Buildkite custom
+agents, Makefile targets), use a plain shell conditional:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export MPM_CATALOG_SOURCES="https://example.com/org/manifest-repo.git@main"
+
+echo "Checking for mpm dependency upgrades..."
+
+if ! mpm outdated --fail-on-upgrade; then
+  echo "ERROR: mpm dependency upgrades are available." >&2
+  echo "Run 'mpm outdated' for details, then update .mpm" >&2
+  echo "and commit a refreshed lock." >&2
+  exit 1
+fi
+
+echo "All mpm dependencies are up to date."
+```
+
+Adapt the error-handling block to your CI system's notification
+mechanism (Slack webhook, PagerDuty alert, email, etc.).
+
+PR gate variant: include the script as a required check in your CI
+configuration. When `mpm outdated --fail-on-upgrade` exits 1, the
+check fails and the PR cannot merge until the `.mpm` file is updated
+and a new lock is committed.
+
+---
+
+## See also
+
+- [docs/configuration.md](configuration.md) -- all environment
+  variables controlling `mpm outdated` and `mpm why`
+  (`MPM_OUTDATED_FORMAT`, `MPM_WHY_FORMAT`,
+  `MPM_WHY_JSON_INDENT`, `MPM_WHY_SUGGEST_MAX_DISTANCE`,
+  `MPM_WHY_SUGGEST_TOP_N`).
+- [docs/list-and-add.md](list-and-add.md) -- the related read/write
+  commands (`mpm search`, `mpm add`, `mpm remove`).
+- [docs/exit-codes.md](exit-codes.md) -- the full exit-code table for
+  all mpm commands.
+- [docs/lockfile.md](lockfile.md) -- lockfile format and how both
+  commands consume it.
+- [docs/version-resolution.md](version-resolution.md) -- how PEP 440
+  constraints are resolved against git tags.

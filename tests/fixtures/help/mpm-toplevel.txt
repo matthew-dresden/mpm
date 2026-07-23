@@ -1,0 +1,38 @@
+mpm -- declarative dependency manager for git-hosted assets
+
+Usage: mpm <command> [options]
+
+Discovery & management:
+  search           Discover catalog entries (grouped by source)
+  add              Add catalog entries to .mpm
+  remove           Remove sources from .mpm
+  list             List declared vs installed sources and their status
+  outdated         Report installable upgrades
+  why              Explain why a transitive dep is in the tree
+
+Lifecycle:
+  install          Install/sync everything in .mpm
+  clean            Remove installed artifacts (use --orphans to also prune unreferenced)
+  validate         Validate XML manifests (subcommands: xml, marketplace, metadata)
+  doctor           Diagnose .mpm / .mpm.lock health
+
+Manifest repo (catalog author):
+  catalog audit    Audit a manifest repo against the standards contract
+  repo             Catalog-author repo subcommands (see mpm repo --help)
+
+Shell integration:
+  completion       Generate shell completion script
+
+Global options (always available):
+  --version                      Print mpm version and exit.
+  --help                         Show this and exit.
+  --quiet / --verbose            Logging verbosity (mutually exclusive).
+  --no-color                     Disable ANSI color (also respects NO_COLOR env var).
+  --no-update-check              Skip the PyPI update-available check (or set MPM_SKIP_UPDATE_CHECK=1).
+  --home / --store-dir <path>    Shared mpm home root (store + caches). Precedence: flag > MPM_HOME env > ~/.mpm-home.
+
+Catalog source (required by commands that resolve a manifest repo; see each subcommand's --help):
+  --catalog-source <url>@<ref>   Override the MPM_CATALOG_SOURCES env var. No default;
+                                 one of --catalog-source or a single MPM_CATALOG_SOURCES
+                                 entry is required for search/add/outdated/why/catalog audit.
+                                 install is hermetic and does not accept a catalog source.

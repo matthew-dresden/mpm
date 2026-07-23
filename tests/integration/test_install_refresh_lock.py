@@ -1,0 +1,339 @@
+"""Integration test: --refresh-lock against a real fixture git repo.
+
+AC-TEST-002: builds a fixture git repo with one tag, installs to produce a
+baseline lockfile, hand-edits the lockfile to record a wrong SHA, runs
+install(refresh_lock=True), asserts the rebuilt lockfile contains the correct
+SHA from the fixture.
+
+End-to-end cycle under the opt-in reconcile contract:
+  - Fixture repo has tags 1.0.0 and 1.1.0.
+  - First install at ==1.0.0 writes lockfile recording the 1.0.0 SHA.
+  - Modify .mpm REVISION to ==1.1.0 (mpm_hash changes).
+  - mpm install --reconcile re-resolves alpha to the 1.1.0 SHA (no error).
+  - A plain or --strict-lock mpm install errors cleanly
+    (LockfileConsistencyError: ref-specs differ) and leaves the lockfile
+    byte-for-byte unchanged.
+  - mpm install --refresh-lock rebuilds the lockfile with the 1.1.0 SHA.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import subprocess
+from unittest.mock import patch
+
+import pytest
+
+from mpm_cli.core.install import (
+    _RefResolution,
+    install,
+)
+from mpm_cli.core.lockfile import LockfileConsistencyError, read_lockfile
+
+
+@pytest.fixture(autouse=True)
+def _mock_resolve_ref_to_sha():
+    """Override: let the test's own patch handle _resolve_ref_to_sha."""
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_check_sha_reachable():
+    """Override: let the test's own subprocess.run patches handle reachability."""
+    yield
+
+
+def _git(*args: str, cwd: pathlib.Path) -> str:
+    """Run a git command and return stdout. Raises RuntimeError on non-zero exit."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "t@t.com",
+        },
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+    return result.stdout.strip()
+
+
+def _sha_for_ref(repo_path: pathlib.Path, ref: str) -> str:
+    """Return the SHA that ref resolves to in the given repo."""
+    return _git("rev-parse", ref, cwd=repo_path)
+
+
+def _build_fixture_repo(base_dir: pathlib.Path) -> tuple[pathlib.Path, str]:
+    """Create a fixture git repo with one commit tagged 1.0.0.
+
+    Returns:
+        (repo_path, sha_v1_0_0) -- path to the repo and the 1.0.0 commit SHA.
+    """
+    repo = base_dir / "fixture-repo"
+    repo.mkdir()
+    _git("init", cwd=repo)
+    _git("checkout", "-b", "main", cwd=repo)
+    (repo / "README.md").write_text("fixture repo v1.0.0\n")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "initial commit", cwd=repo)
+    _git("tag", "1.0.0", cwd=repo)
+    sha = _sha_for_ref(repo, "refs/tags/1.0.0")
+    return repo, sha
+
+
+def _add_tag(repo_path: pathlib.Path, tag: str) -> str:
+    """Add a new commit and tag it. Returns the new commit SHA."""
+    (repo_path / "VERSION").write_text(f"{tag}\n")
+    _git("add", "VERSION", cwd=repo_path)
+    _git("commit", "-m", f"release {tag}", cwd=repo_path)
+    _git("tag", tag, cwd=repo_path)
+    return _sha_for_ref(repo_path, f"refs/tags/{tag}")
+
+
+def _write_mpm(
+    project_dir: pathlib.Path,
+    source_url: str,
+    revision: str = "==1.0.0",
+) -> pathlib.Path:
+    """Write a minimal .mpm file pointing at source_url with the given revision.
+
+    Bare filesystem paths are coerced to ``file://`` URLs so the URL parser
+    introduced by E1-F2-S1-T1 accepts them; the autouse
+    ``_default_allow_insecure_remotes`` fixture in conftest then permits the
+    non-HTTPS/SSH scheme through ``_enforce_remote_url_policy``.
+    """
+    if source_url.startswith("/"):
+        source_url = f"file://{source_url}"
+    mpm_path = project_dir / ".mpm"
+    mpm_path.write_text(
+        f"GITBASE=https://unused.example.com\n"
+        f"CLAUDE_MARKETPLACES_DIR=/tmp/mktplc\n"
+        f"MPM_MARKETPLACE_INSTALL=false\n"
+        f"MPM_SOURCE_alpha_URL={source_url}\n"
+        f"MPM_SOURCE_alpha_REF={revision}\n"
+        f"MPM_SOURCE_alpha_PATH=manifest.xml\n"
+        f"MPM_SOURCE_alpha_NAME=alpha\n"
+        f"MPM_SOURCE_alpha_GITBASE=https://example.com\n"
+    )
+    mpm_path.chmod(0o600)
+    return mpm_path
+
+
+_CATALOG_SOURCE = "https://catalog.example.com/repo.git@main"
+
+_FAKE_CATALOG_SHA = "c" * 40
+
+
+def _run_install_mocked(
+    mpm_path: pathlib.Path,
+    catalog_source: str = _CATALOG_SOURCE,
+    refresh_lock: bool = False,
+    *,
+    strict_lock: bool = False,
+    reconcile: bool = False,
+) -> None:
+    """Call install() with repo tool calls mocked out.
+
+    _resolve_ref_to_sha is patched only for the catalog URL; calls for real
+    local source repos pass through so SHA values from the fixture git repo
+    are recorded in the lockfile.  ``strict_lock`` and ``reconcile`` are
+    forwarded to ``install()``; ``reconcile`` opts in to the lenient
+    npm-install reconcile a plain install no longer performs on a drifted lock.
+    """
+    import mpm_cli.core.install as _install_mod
+
+    original_resolve_ref = _install_mod._resolve_ref_to_sha
+
+    catalog_url = catalog_source.rsplit("@", 1)[0] if "@" in catalog_source else catalog_source
+
+    def _resolve_ref_patched(url: str, ref: str) -> _RefResolution:
+        if url == catalog_url:
+            return _RefResolution(sha=_FAKE_CATALOG_SHA, resolved_ref=f"refs/heads/{ref}")
+        return original_resolve_ref(url, ref)
+
+    with (
+        patch("mpm_cli.repo.repo_init"),
+        patch("mpm_cli.repo.repo_envsubst"),
+        patch("mpm_cli.repo.repo_sync"),
+        patch("mpm_cli.core.install._resolve_ref_to_sha", side_effect=_resolve_ref_patched),
+    ):
+        install(
+            mpm_path,
+            lock_file_path=mpm_path.parent / ".mpm.lock",
+            refresh_lock=refresh_lock,
+            strict_lock=strict_lock,
+            reconcile=reconcile,
+        )
+
+
+@pytest.mark.integration
+class TestRefreshLockRebuildsLockfile:
+    """AC-TEST-002: --refresh-lock against fixture repo with a stale lockfile."""
+
+    def test_refresh_lock_rewrites_stale_lockfile(self, tmp_path: pathlib.Path) -> None:
+        """install(refresh_lock=True) with a hand-edited stale lockfile rewrites
+        the lockfile and records the current resolved SHA from the fixture repo."""
+        fixture_dir = tmp_path / "fixture"
+        fixture_dir.mkdir()
+        repo_path, sha_v1 = _build_fixture_repo(fixture_dir)
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        mpm_path = _write_mpm(project_dir, str(repo_path))
+
+        _run_install_mocked(mpm_path)
+
+        lock_path = project_dir / ".mpm.lock"
+        assert lock_path.exists()
+        lf_before = read_lockfile(lock_path)
+        assert lf_before.sources[0].resolved_sha == sha_v1
+
+        stale_sha = "d" * 40
+        original_text = lock_path.read_text()
+        corrupted = original_text.replace(sha_v1, stale_sha)
+        lock_path.write_text(corrupted)
+
+        lf_stale = read_lockfile(lock_path)
+        assert lf_stale.sources[0].resolved_sha == stale_sha
+
+        _run_install_mocked(mpm_path, refresh_lock=True)
+
+        lf_after = read_lockfile(lock_path)
+        assert lf_after.sources[0].resolved_sha == sha_v1, (
+            f"Expected SHA {sha_v1!r} after --refresh-lock; got {lf_after.sources[0].resolved_sha!r}"
+        )
+
+    def test_refresh_lock_info_line_emitted(
+        self,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """install(refresh_lock=True) emits the 'lockfile rebuilt from .mpm' info-line."""
+        fixture_dir = tmp_path / "fixture"
+        fixture_dir.mkdir()
+        repo_path, _sha = _build_fixture_repo(fixture_dir)
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        mpm_path = _write_mpm(project_dir, str(repo_path))
+
+        _run_install_mocked(mpm_path)
+
+        capsys.readouterr()
+
+        _run_install_mocked(mpm_path, refresh_lock=True)
+
+        captured = capsys.readouterr()
+        assert "lockfile rebuilt from .mpm" in captured.out
+
+    def test_refresh_lock_does_not_modify_mpm_file(self, tmp_path: pathlib.Path) -> None:
+        """install(refresh_lock=True) must not modify the .mpm file (AC-FUNC-002)."""
+        fixture_dir = tmp_path / "fixture"
+        fixture_dir.mkdir()
+        repo_path, _sha = _build_fixture_repo(fixture_dir)
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        mpm_path = _write_mpm(project_dir, str(repo_path))
+        original_mpm = mpm_path.read_text()
+
+        _run_install_mocked(mpm_path, refresh_lock=True)
+
+        assert mpm_path.read_text() == original_mpm, "--refresh-lock must not modify the .mpm file"
+
+
+@pytest.mark.integration
+class TestRefreshLockCycle:
+    """End-to-end hash-mismatch cycle under the npm-like reconcile contract.
+
+    Plain `mpm install` reconciles a changed revision spec (no error);
+    `--strict-lock` errors cleanly; `--refresh-lock` is the explicit full
+    rebuild. All three paths land on the new 1.1.0 pin (reconcile/refresh) or
+    leave the lock untouched (strict-lock).
+    """
+
+    def test_hash_mismatch_then_plain_install_reconciles(self, tmp_path: pathlib.Path) -> None:
+        """install --reconcile reconciles a changed spec to the new pin (no error).
+
+        1. Fixture repo has tags 1.0.0 and 1.1.0.
+        2. First install at ==1.0.0 writes lockfile with 1.0.0 SHA.
+        3. Modify .mpm REVISION to ==1.1.0 -> mpm_hash changes.
+        4. mpm install --reconcile re-resolves alpha to the 1.1.0 SHA.
+        """
+        fixture_dir = tmp_path / "fixture"
+        fixture_dir.mkdir()
+        repo_path, sha_v1 = _build_fixture_repo(fixture_dir)
+        sha_v2 = _add_tag(repo_path, "1.1.0")
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpm_path = _write_mpm(project_dir, str(repo_path), revision="==1.0.0")
+        _run_install_mocked(mpm_path)
+
+        lock_path = project_dir / ".mpm.lock"
+        assert lock_path.exists()
+        lf_v1 = read_lockfile(lock_path)
+        assert lf_v1.sources[0].resolved_sha == sha_v1
+
+        _write_mpm(project_dir, str(repo_path), revision="==1.1.0")
+
+        _run_install_mocked(mpm_path, reconcile=True)
+
+        lf_v2 = read_lockfile(lock_path)
+        assert lf_v2.sources[0].resolved_sha == sha_v2, (
+            f"Expected reconcile to record 1.1.0 SHA {sha_v2!r}; got {lf_v2.sources[0].resolved_sha!r}"
+        )
+        assert lf_v2.sources[0].resolved_sha != sha_v1
+
+    def test_hash_mismatch_strict_lock_errors_then_refresh_lock_succeeds(self, tmp_path: pathlib.Path) -> None:
+        """--strict-lock errors cleanly on the changed spec; --refresh-lock then rebuilds.
+
+        1. Fixture repo has tags 1.0.0 and 1.1.0.
+        2. First install at ==1.0.0 writes lockfile with 1.0.0 SHA.
+        3. Modify .mpm REVISION to ==1.1.0 -> mpm_hash changes.
+        4. mpm install --strict-lock fails with LockfileConsistencyError
+           (the ref-specs differ check fires before resolving); lock unchanged.
+        5. mpm install --refresh-lock succeeds, lockfile records 1.1.0 SHA.
+        """
+        fixture_dir = tmp_path / "fixture"
+        fixture_dir.mkdir()
+        repo_path, sha_v1 = _build_fixture_repo(fixture_dir)
+        sha_v2 = _add_tag(repo_path, "1.1.0")
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpm_path = _write_mpm(project_dir, str(repo_path), revision="==1.0.0")
+        _run_install_mocked(mpm_path)
+
+        lock_path = project_dir / ".mpm.lock"
+        assert lock_path.exists()
+        assert read_lockfile(lock_path).sources[0].resolved_sha == sha_v1
+        lock_before = lock_path.read_bytes()
+
+        _write_mpm(project_dir, str(repo_path), revision="==1.1.0")
+
+        with pytest.raises(LockfileConsistencyError) as exc_info:
+            _run_install_mocked(mpm_path, strict_lock=True)
+        message = str(exc_info.value)
+        assert "ref-specs differ" in message
+        assert "--refresh-lock" in message
+        assert "BUG:" not in message
+        assert lock_path.read_bytes() == lock_before, "--strict-lock must not mutate the lockfile"
+
+        _run_install_mocked(mpm_path, refresh_lock=True)
+
+        lf_v2 = read_lockfile(lock_path)
+        assert lf_v2.sources[0].resolved_sha == sha_v2, (
+            f"Expected lockfile to record 1.1.0 SHA {sha_v2!r}; got {lf_v2.sources[0].resolved_sha!r}"
+        )
+        assert lf_v2.sources[0].resolved_sha != sha_v1

@@ -1,0 +1,271 @@
+# Contributing to MPM CLI
+
+Thank you for your interest in contributing to the MPM CLI! This document provides guidelines and instructions for contributing to this project.
+
+## Development Setup
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/matthew-dresden/mpm.git
+   cd mpm
+   ```
+
+2. Install development dependencies:
+   ```bash
+   make install-dev
+   ```
+
+3. Set up git hooks to ensure code quality:
+   ```bash
+   make install-hooks
+   ```
+
+   This will:
+   - Install pre-commit hooks (secrets detection, formatting, YAML validation)
+   - Set up a pre-push hook that runs lint + tests before pushing
+
+4. Run tests to verify your setup:
+   ```bash
+   make test
+   ```
+
+## Code Style and Quality
+
+We use the following tools to maintain code quality:
+
+- **Ruff**: For code formatting and linting
+- **yamllint**: For YAML validation and formatting
+- **no-comments gate**: Forbids `#` comments in mpm-owned Python (see below)
+- **pre-commit**: For automated checks on commit
+
+Before submitting a pull request, ensure your code passes all checks:
+
+```bash
+make lint
+```
+
+To auto-fix formatting issues:
+
+```bash
+make format
+```
+
+To run all pre-commit checks:
+
+```bash
+make pre-commit-check
+```
+
+### No-Comments Policy
+
+All first-party mpm Python (everything under `src/mpm_cli/`, `tests/`,
+`scripts/`, `tools/` and `.devcontainer/`, excluding the vendored
+`src/mpm_cli/repo/` subtree and generated directories such as `__pycache__`
+and `.venv`) must contain no `#` comments. Docstrings
+are the sanctioned way to describe what code does: put intent in module, class,
+and function docstrings rather than inline comments. Code that needs an inline
+`#` note to be understood should be refactored or renamed so it reads clearly on
+its own.
+
+Only two `#` lines are allowed, and only at the very top of a file:
+
+- A line-1 shebang (for example `#!/usr/bin/env python3`).
+- A PEP 263 encoding cookie on line 1 or line 2 (for example
+  `# -*- coding: utf-8 -*-`).
+
+A `#` character inside a string literal is part of the string, not a comment, so
+it is never flagged.
+
+The gate is enforced three ways, all running the same
+`tools/lint/check_no_comments.py` check:
+
+- Run it locally with `make lint-no-comments`. It is also wired into
+  `make lint-check`, so `make lint` and `make check` run it too.
+- The `no-comments` pre-commit hook runs it on staged Python files; install the
+  hooks with `make install-hooks`.
+- CI enforces it through the `lint-check` job (which runs `make lint-check`) in
+  both `pr-validation.yml` and `main-validation.yml`, so no separate workflow
+  step is needed.
+
+## Commit Message Conventions
+
+This project follows [Conventional Commits](https://www.conventionalcommits.org/) for commit messages. This enables automatic semantic versioning and changelog generation.
+
+### How Version Bumps Work
+
+**The PR title is the single most important thing for versioning.**
+
+When a PR is squash-merged to `main`, GitHub generates a squash commit whose title is the PR title. `python-semantic-release` reads that squash commit to determine the version bump. This means:
+
+1. Your **PR title** must follow the conventional commit format
+2. Individual commit messages on your branch can be anything (but conventional format is recommended)
+3. The squash commit title (= PR title) drives the version bump
+
+### Commit Message Format
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+### Supported Commit Types
+
+| Type | Description | Version Bump | Example |
+|------|-------------|--------------|---------|
+| `feat` | New feature | **Minor** (0.1.0 -> 0.2.0) | `feat: add new command option` |
+| `fix` | Bug fix | **Patch** (0.1.0 -> 0.1.1) | `fix: resolve parsing error` |
+| `perf` | Performance improvement | **Patch** (0.1.0 -> 0.1.1) | `perf: optimize file processing` |
+| `security` | Security fix | **Patch** (0.1.0 -> 0.1.1) | `security: fix path traversal vulnerability` |
+| `revert` | Revert previous change | **Patch** (0.1.0 -> 0.1.1) | `revert: undo feature X implementation` |
+| `build` | Build system changes | No bump | `build: update dependencies` |
+| `chore` | Maintenance tasks | No bump | `chore: update documentation` |
+| `ci` | CI/CD changes | No bump | `ci: add workflow caching` |
+| `docs` | Documentation changes | No bump | `docs: update API examples` |
+| `refactor` | Code refactoring | No bump | `refactor: simplify error handling` |
+| `style` | Code style changes | No bump | `style: fix formatting` |
+| `test` | Test changes | No bump | `test: add unit tests for parser` |
+
+### Breaking Changes
+
+Any commit type with `!` suffix OR `BREAKING CHANGE:` in the footer triggers a **Major** version bump (0.1.0 -> 1.0.0):
+
+```
+feat!: change CLI interface
+
+BREAKING CHANGE: The install command now requires explicit manifest path argument
+```
+
+### Examples
+
+- `feat: add support for custom templates`
+- `fix: handle missing configuration files gracefully`
+- `perf: cache parsed templates for improved performance`
+- `docs: add troubleshooting section to README`
+- `chore(deps): update semantic-release to v9.0.0`
+
+## Configuration
+
+### Runtime Environment Variables
+
+These variables control runtime behavior of the mpm library API.
+
+| Variable | Purpose | Format | Required |
+|----------|---------|--------|----------|
+| `MPM_MAX_REPO_RESTART_RETRIES` | Controls the maximum number of times `run_from_args()` will retry a command when `RepoChangedException` triggers an internal repo-subsystem restart. The retry loop intercepts the `os.execv` call that `mpm repo` uses to restart itself after an upgrade, so the calling process is never replaced. When the limit is exhausted, `RepoCommandError` is raised with a descriptive message. Read on every `run_from_args()` call so changes take effect without a process restart. | Non-negative integer; `0` disables retries, e.g. `3` | Optional -- defaults to `3` |
+
+## Testing
+
+### Unit Tests
+
+Unit tests are located in the `tests/unit` directory. They test individual components in isolation.
+
+```bash
+make test-unit
+```
+
+### Integration Tests
+
+Integration tests live in `tests/integration` and verify modules load and run end-to-end with real internal collaborators.
+
+```bash
+make test-integration
+```
+
+Some integration fixtures `git init` fresh repos and reference them as `@main`,
+so your environment must set `git config --global init.defaultBranch main`
+before running them. See the "Test prerequisites" section in
+[docs/integration-testing.md](docs/integration-testing.md) for the full
+explanation. CI sets this automatically via `.github/actions/setup-mpm`, and
+the mpm devcontainer sets it in its postcreate script.
+
+### Functional Tests
+
+Functional tests are located in the `tests/functional` directory. They test the CLI commands as used by actual users.
+
+```bash
+make test-functional
+```
+
+### Scenario Tests
+
+Scenario tests live in `tests/scenarios` and automate every in-scope scenario from `docs/integration-testing.md`. Each test invokes `mpm` / `git` as real subprocesses against on-disk fixtures (no mocks, no network), mirroring exactly what a human would type. The harness lives in `tests/scenarios/conftest.py`.
+
+```bash
+make test-scenarios
+```
+
+A coverage meta test (`tests/scenarios/test_scenario_coverage_meta.py`) fails CI if any in-scope scenario in `docs/integration-testing.md` lacks a matching pytest test. To add a new scenario: add the `### XX-NN: <title>` heading + bash block to `docs/integration-testing.md`, then add a `@pytest.mark.scenario` test under `tests/scenarios/test_<category>.py` that references the scenario ID in its function name or docstring.
+
+### Test Requirements
+
+- **Unit Tests**: Must maintain at least 90% code coverage (CI threshold)
+- **Functional Tests**: Must test all CLI commands and common error scenarios
+- **Scenario Tests**: Every in-scope scenario from `docs/integration-testing.md` must have a matching pytest test (enforced by the coverage meta test)
+- All tests must pass before merging
+
+### Running All Tests
+
+```bash
+make test
+```
+
+### Coverage Report
+
+```bash
+make test-cov
+```
+
+## Pull Request Process
+
+### Branch Naming
+
+Use descriptive branch names with type prefixes:
+- `feat/add-export-command`
+- `fix/handle-empty-config`
+- `docs/update-readme`
+
+### Steps
+
+1. Pull `main`: `git checkout main && git pull`
+2. Create a new branch: `git checkout -b feat/my-change`
+3. Implement your changes with appropriate tests
+4. Ensure all tests pass: `make test`
+5. Ensure lint passes: `make lint`
+6. Commit and push: `git add <files> && git commit -m "feat: description" && git push`
+7. Open a PR to `main`
+   - **Set the PR title** using conventional commit format (this drives the version bump!)
+   - Request review from code owners
+8. Address review feedback
+9. PR will be **squash-merged** to `main`
+
+### PR Title Format
+
+The PR title **must** follow conventional commit format because it becomes the squash commit message that drives semantic versioning:
+
+- `feat: add new search filter option` -> triggers MINOR bump
+- `fix(install): handle missing mpm config` -> triggers PATCH bump
+- `docs: update CLI reference` -> no version bump
+- `feat!: redesign manifest format` -> triggers MAJOR bump
+
+## Release Process
+
+The release pipeline is fully automated. When changes are merged to `main`:
+
+1. Main branch validation runs (lint, tests, security scan)
+2. A manual QA approval gate pauses the pipeline
+3. After QA approval, `python-semantic-release` computes the next version from commit messages
+4. The pipeline generates a changelog, updates version files, creates a release PR, merges it, tags the release, and triggers PyPI publishing
+
+**You do not need to manually bump versions, update changelogs, or create tags.** The pipeline handles all of this based on your PR title's conventional commit prefix.
+
+## Adding New Features
+
+When adding new features:
+
+1. Create unit tests for all new code
+2. Create functional tests that test the feature from a user perspective
+3. Update documentation in the README.md if user-facing behavior changes
+4. Update help text in the CLI commands

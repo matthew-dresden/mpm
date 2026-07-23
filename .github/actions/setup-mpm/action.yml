@@ -1,0 +1,161 @@
+name: Setup mpm CI environment
+description: |
+  Composite action shared by every job in pr-validation.yml and
+  main-validation.yml. Handles checkout, optional simulate-merge,
+  Python install, asdf bootstrap (plus plugin install per
+  .tool-versions), pip dependency cache, dev dependency install via
+  `make install-dev`, and uv install. Each parallel CI job calls this
+  action once before invoking its own singular Make target / pytest
+  invocation, so the per-job step list stays minimal and the setup
+  drift between jobs is impossible.
+
+inputs:
+  base-ref:
+    description: >-
+      Base ref to simulate-merge against. Leave empty to skip the
+      simulate-merge step (e.g. for push-to-main runs); set to the
+      pull-request base ref for pull_request runs.
+    required: false
+    default: ''
+  head-sha:
+    description: >-
+      Head SHA to merge into the base ref. Required when base-ref is
+      non-empty; ignored otherwise.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # NOTE: callers MUST run `actions/checkout@v6` BEFORE `uses: ./...setup-mpm`
+    # because GitHub Actions resolves the composite action path against the
+    # runner's working directory; without a prior checkout the action file
+    # is not yet on disk. Every job in pr-validation.yml / main-validation.yml
+    # does its own `actions/checkout@v6` step explicitly.
+    # Configure a global git identity unconditionally so the runner
+    # environment is identical for pull_request and push-to-main runs.
+    # Previously this was nested inside the `if: inputs.base-ref != ''`
+    # Simulate-merge step, which fires only on PR runs; push-to-main
+    # runs ran with no global identity, so any test that depended on
+    # one passed on PR validation but failed on Main Branch Validation.
+    # Tests should not depend on this baseline (each test fixture
+    # configures identity locally on its own repos) but having a
+    # consistent environment across both workflows prevents the same
+    # class of divergence from masking future test fixture bugs at PR
+    # time.
+    - name: Configure default git identity
+      shell: bash
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        # tests/integration/test_complete_catalog_entries.py and
+        # tests/integration/test_background_refresh.py create fresh git
+        # repos via `git init` and refer to the result by the symbolic ref
+        # `main` (e.g. `MPM_CATALOG_SOURCE=file://<repo>@main`). On the
+        # GitHub-hosted ubuntu-* runners `init.defaultBranch` is `master`
+        # unless explicitly overridden, so without this config the fresh
+        # repos have only `master` and the `@main` lookup returns empty.
+        # The mpm devcontainer already sets this, which is why these
+        # tests pass locally but fail in CI.
+        git config --global init.defaultBranch main
+
+    - name: Simulate merge
+      if: inputs.base-ref != ''
+      shell: bash
+      run: |
+        git fetch origin ${{ inputs.base-ref }}
+        git checkout -b pr-validation origin/${{ inputs.base-ref }}
+        git merge --no-commit --no-ff ${{ inputs.head-sha }}
+
+    - name: Setup Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.14'
+
+    - name: Cache ASDF installation
+      # asdf is a POSIX/bash tool and is not supported on Windows runners; it
+      # installs jq + pre-commit (.tool-versions), which only the Linux-only
+      # lint/pre-commit jobs consume. The Windows test legs get their Python
+      # from actions/setup-python and their deps from pip, so the asdf bootstrap
+      # is restricted to Linux.
+      if: runner.os == 'Linux'
+      uses: actions/cache@v5
+      with:
+        path: ~/.asdf
+        key: ${{ runner.os }}-asdf-v0.15.0-${{ hashFiles('.tool-versions') }}
+        restore-keys: |
+          ${{ runner.os }}-asdf-v0.15.0-
+
+    - name: Install ASDF
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if [ ! -d ~/.asdf ]; then
+          git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.15.0
+        fi
+        echo "$HOME/.asdf/bin" >> $GITHUB_PATH
+        echo "$HOME/.asdf/shims" >> $GITHUB_PATH
+        source $HOME/.asdf/asdf.sh
+
+    - name: Install ASDF plugins and tools
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        cd $GITHUB_WORKSPACE
+        source $HOME/.asdf/asdf.sh
+        cut -d' ' -f1 .tool-versions | xargs -I{} asdf plugin add {} || true
+        asdf plugin remove python 2>/dev/null || true
+        asdf install
+        asdf reshim
+
+    - name: Cache Python dependencies
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.local/lib/python*/site-packages
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements-dev.txt', 'pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install zsh (for shell-completion integration tests)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # tests/integration/test_completion_zsh.py,
+        # tests/integration/test_preamble_zsh.py, and
+        # tests/integration/test_midtoken_zsh.py shell out to a real zsh to
+        # exercise the dynamic completion machinery. The mpm devcontainer
+        # ships with zsh, but the GitHub Actions ubuntu-latest runners do
+        # not; install it explicitly so the zsh suite has the binary it
+        # asserts on (`assert shutil.which("zsh") is not None`).
+        set -euo pipefail
+        if ! command -v zsh >/dev/null 2>&1; then
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends zsh
+        fi
+        zsh --version
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        pip install --upgrade pip
+        # `make install-dev` is `pip install -r requirements-dev.txt`. GNU make
+        # is not guaranteed on the windows-latest runner image, so the Windows
+        # leg invokes pip directly (same dependency set, no make dependency)
+        # while Linux keeps the make target for parity with local dev.
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          make install-dev
+        else
+          pip install -r requirements-dev.txt
+        fi
+
+    - name: Install uv
+      # `tests/unit/repo/test_wheel_contents.py`,
+      # `tests/integration/test_wheel_e2e.py`, and
+      # `tests/integration/test_ci_validation.py` shell out to
+      # `uv build` to produce the wheel under test; uv must be on
+      # PATH for any job that runs those suites (including the
+      # full-suite regression job that runs every test together).
+      uses: astral-sh/setup-uv@v6

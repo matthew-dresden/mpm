@@ -1,0 +1,257 @@
+# MPM Architecture: Install Engine Internals
+
+This document describes the internals of the `mpm install` engine for
+**mpm contributors** and **advanced operators** who want to understand what
+happens during `mpm install`.
+
+For operator-facing usage see `docs/lifecycle.md`.
+For the lockfile schema see [`docs/lockfile.md`](lockfile.md).
+For configuration see [`docs/configuration.md`](configuration.md).
+For the security model see [`docs/security-model.md`](security-model.md).
+
+---
+
+## Audience
+
+This document is written for two audiences:
+
+- **MPM contributors** working on the install engine, lockfile state machine,
+  or the embedded repo-fork carve-out (`src/mpm_cli/repo/`).
+- **Advanced operators** who need to understand the exact directory layout
+  produced by `mpm install`, the lockfile-to-clone mapping, the retry
+  policy, and the error-propagation contract so they can diagnose failures
+  without opening the source code.
+
+Operators who only need day-to-day usage guidance should read
+[`docs/lifecycle.md`](lifecycle.md) instead.
+
+---
+
+## Embedded repo-fork install engine
+
+MPM vendors a fork of Google's `repo` tool at `src/mpm_cli/repo/`.
+
+### Vendored carve-out
+
+The fork is shipped as part of the mpm wheel. No external `repo` binary is
+required or used. The vendored path is a declared scope carve-out in
+`CLAUDE.md`: mypy and bandit do not check `src/mpm_cli/repo/`. This
+carve-out is a scope demarcation, not a bypass annotation; it must not be
+extended to any other path.
+
+Operators never invoke `repo` directly. The CLI entry points are
+`mpm install`, `mpm add`, and `mpm remove`. The embedded fork is an
+implementation detail.
+
+### Call sequence
+
+For each source listed in the resolved lockfile, `core/install.py` calls the
+fork in three steps:
+
+1. **`repo_init`** -- initialises a repo workspace inside
+   `.mpm-data/sources/<name>/` using the manifest XML URL and the resolved
+   revision. Raises `RepoCommandError` on non-zero exit.
+
+2. **`repo_envsubst`** -- expands `${GITBASE}` and `${CLAUDE_MARKETPLACES_DIR}`
+   variable references inside the manifest XML before sync.
+
+3. **`repo_sync`** -- clones every `<project>` referenced by the manifest XML
+   at the locked SHA. Walks `<include>` chains transitively. Raises
+   `RepoCommandError` on non-zero exit.
+
+All three functions are defined in `src/mpm_cli/repo/` and are called
+exclusively from `core/install.py::_run_install`.
+
+---
+
+## Directory layout
+
+After `mpm install` completes, the project directory contains the following
+layout. Operators must treat `.mpm-data/` as opaque; use `.mpm.lock` as
+the source of truth for which clones exist.
+
+```text
+<project-root>/
+  .mpm                        # operator-authored config file
+  .mpm.lock                   # generated lockfile (commit this)
+  .mpm-data/
+    .mpm-install.lock         # flock-managed concurrency lock
+    sources/
+      <source-name>/            # one directory per top-level source
+        .repo/                  # managed by the embedded repo fork
+        <project-dir>/          # cloned project directories
+        .packages/              # per-source package symlinks
+  .packages/                    # aggregated symlinks (operator-facing)
+```
+
+Key paths:
+
+- **`.mpm-data/sources/<name>/`** -- per-source workspace holding the
+  manifest XML, transitive includes, and repo state. One directory per
+  top-level source declared in `.mpm`.
+- **`.mpm-data/.mpm-install.lock`** -- `fcntl.flock(LOCK_EX)` file.
+  All workspace-mutating commands acquire this lock before any filesystem
+  mutation. A stale lock left by a killed process is harmless; the next
+  invocation reopens and re-acquires it.
+- **`.packages/`** -- aggregated symlinks pointing into the per-source
+  `.packages/*` entries. This is the only directory operators need to
+  reference in downstream tooling.
+- **`<MPM_HOME>/store/.gitignore`** -- `mpm install` writes this
+  safety net (containing `*`) ONLY when the shared `MPM_HOME` store sits
+  inside a git working tree, so the fetched-artifact cache is never committed.
+  With the default `~/.mpm-home` (not a git repo), `mpm install` writes no
+  `.gitignore` at all.
+
+If the `.mpm-data/` directory layout becomes inconsistent (for example after
+a SIGTERM mid-clone), run `mpm clean` to prune and recover.
+
+---
+
+## Lockfile-to-clone mapping
+
+For each `[[sources]]` entry in `.mpm.lock`, the install engine:
+
+1. Reads the locked SHA from `lockfile.sources[n].resolved_sha`.
+2. Creates `.mpm-data/sources/<name>/` if it does not exist.
+3. Calls `repo_init` with the manifest URL and the locked SHA, initialising
+   a repo workspace inside `.mpm-data/sources/<name>/`.
+4. Calls `repo_sync` to clone every `<project>` referenced by the manifest
+   XML at exactly the locked SHA. Transitive `<include>` chains are walked
+   fully.
+5. Symlinks from `.mpm-data/sources/<name>/.packages/*` are aggregated
+   into the top-level `.packages/` directory by `aggregate_symlinks` in
+   `core/install.py`. A `ValueError` is raised immediately on package name
+   collision.
+
+In the `LOCKFILE_CONSISTENT` state (hash unchanged), locked SHAs are
+replayed verbatim from the lockfile. No version re-resolution via the
+catalog occurs. One `git ls-remote` call per source verifies SHA
+reachability; if a SHA is no longer reachable a `LockfileUnreachableShaError`
+is raised naming the source, SHA, and remote URL.
+
+In the `LOCKFILE_ABSENT` state, each source URL and revision is resolved to
+a concrete git ref and SHA via `git ls-remote` before `repo_init` is called.
+The resulting SHAs are written to `.mpm.lock` atomically at the end of the
+install step (write-temp-then-rename).
+
+Cross-reference: [`docs/lockfile.md`](lockfile.md) describes the lockfile
+TOML schema and the `mpm_hash` field in detail.
+
+---
+
+## Retry policy
+
+`git ls-remote` calls inside the embedded repo fork
+(`src/mpm_cli/repo/project.py::_run_ls_remote_with_retry`) are retried up
+to `MPM_GIT_RETRY_COUNT` times (default 3). The delay before each retry
+uses exponential backoff: `delay = MPM_GIT_RETRY_DELAY * (2 ** (attempt -
+1))`, where `MPM_GIT_RETRY_DELAY` (default 1 second) is the base delay.
+Attempt 1 waits the base delay; attempt 2 waits twice that; attempt 3 waits
+four times that.
+
+`MPM_GIT_RETRY_DELAY` is the **only** sleep-based wait in non-vendored
+mpm code. The vendored fork at `src/mpm_cli/repo/` also contains a
+separate exponential-backoff sleep inside `retry_fetches` (controlled by
+`MPM_MAX_RETRY_SLEEP_SEC` and `MPM_RETRY_JITTER_PERCENT`), but that code
+is inside the vendored carve-out and is not part of the mpm source
+surface. Every other synchronization mechanism in non-vendored mpm code
+uses readiness detection or event-driven callbacks.
+
+**Authentication-error bypass.** When the `git ls-remote` stderr output
+matches any pattern in `GIT_AUTH_ERROR_PATTERNS` (defined in
+`src/mpm_cli/constants.py`), the retry loop exits immediately and the
+error is surfaced without further attempts. Retrying an auth failure would
+only produce identical failures and waste time.
+
+`repo_init` and `repo_sync` calls from `core/install.py` are single-shot
+and are not retried by this mechanism.
+
+Both `MPM_GIT_RETRY_COUNT` and `MPM_GIT_RETRY_DELAY` are read at call
+time from the environment; their defaults are defined in
+`src/mpm_cli/constants.py` (`GIT_RETRY_COUNT_DEFAULT` and
+`GIT_RETRY_DELAY_DEFAULT`).
+
+---
+
+## Error propagation
+
+Every git stderr line produced by the embedded engine is surfaced verbatim
+to the operator's terminal with a prefix identifying the source name, for
+example:
+
+```text
+[source: my-org-packages] error: Repository not found.
+[source: my-org-packages] fatal: Could not read from remote repository.
+```
+
+The full error-propagation contract:
+
+- `install` (outer): acquires the concurrency lock via
+  `mpm_workspace_lock`; raises `OSError` if `.mpm-data/` cannot be
+  created.
+- `_run_install` (inner): propagates all exceptions from sub-steps without
+  catching and discarding. Callers see the original exception type.
+- Library code in `core/install.py` never calls `sys.exit()`. Only CLI
+  command handlers in `src/mpm_cli/commands/` or `cli.py` exit.
+- Every error path produces a clear, actionable message sent to stderr. No
+  silent failures, no swallowed exceptions.
+
+Hard-error states (`LOCKFILE_UNREACHABLE`, `LOCKFILE_SOURCE_MISMATCH`)
+raise typed exception subclasses of `InstallError(Exception)` before any
+filesystem mutation occurs. A `mpm_hash` mismatch is NOT a hard error
+on plain install: it derives the `RECONCILE` state and reconciles
+`.mpm` against the lockfile npm-style (prune orphans, resolve
+added/changed sources, replay unchanged ones, write the rebuilt lock once
+on success). Under `--strict-lock` the mismatch is a hard error
+(`OrphanedLockEntryError` for a pure removal, otherwise
+`MPMHashMismatchError`) and the lockfile is never mutated. Each
+exception renders in the spec's standard three-line shape:
+
+```text
+ERROR: <one-line summary>
+<context lines wrapped at 80 columns>
+Remediation: <operator next step>
+```
+
+Cross-reference: [`docs/security-model.md`](security-model.md) describes
+which errors are never silenced for security reasons.
+
+---
+
+## Why mpm doesn't use an external repo tool
+
+MPM vendors the `repo` fork rather than depending on the system `repo`
+binary for the following reasons:
+
+1. **Deterministic install behaviour.** A vendored fork is pinned to a
+   specific, tested revision. Upstream `repo` has a rolling release model;
+   depending on the system binary would expose mpm to unexpected breakage
+   from operator-controlled upgrades.
+
+2. **No external binary dependency.** Operators do not need to install or
+   manage a separate `repo` tool. The mpm wheel is self-contained. This
+   simplifies CI pipelines and reduces the operator's setup burden.
+
+3. **Controlled error reporting.** The fork exposes a Python API
+   (`repo_init`, `repo_envsubst`, `repo_sync`) that allows mpm to capture
+   stderr verbatim and prefix it with the source name before surfacing it to
+   the operator. A subprocess call to an external binary would make this
+   structured forwarding harder.
+
+4. **No provider-specific tooling.** Per spec Section 3.6, mpm never calls
+   provider HTTP APIs (`api.github.com`, `gitlab.com/api`, etc.) and never
+   shells out to provider CLIs (`gh`, `glab`, `bb`, `tea`). All git
+   interaction is via the `git` binary only. Vendoring `repo` keeps this
+   boundary clean; there is no temptation to use provider-specific
+   extensions bundled with third-party repo tools.
+
+---
+
+## See also
+
+- [`docs/lockfile.md`](lockfile.md) -- lockfile TOML schema, `mpm_hash`
+  field, and the five-row install state matrix.
+- [`docs/configuration.md`](configuration.md) -- all environment variables,
+  including `MPM_CATALOG_SOURCES` and `MPM_GIT_LS_REMOTE_TIMEOUT`.
+- [`docs/security-model.md`](security-model.md) -- the no-provider-API rule,
+  the no-credentials-caching rule, and the auth-error pattern list.

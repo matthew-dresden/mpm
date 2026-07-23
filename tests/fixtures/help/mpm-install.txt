@@ -1,0 +1,61 @@
+usage: mpm install [-h] [--refresh-lock | --refresh-lock-source NAME]
+                   [--reconcile] [--strict-lock] [--strict-drift]
+                   [--lock-file PATH]
+                   [mpmenv_path]
+
+Execute the full MPM install lifecycle.
+
+Parses the .mpm configuration file, then runs repo init/envsubst/sync
+for each source defined in the .mpm file. Aggregates packages into
+.packages/ via symlinks.
+
+positional arguments:
+  mpmenv_path           Path to the .mpm configuration file (default: auto-
+                        discover from current directory)
+
+options:
+  -h, --help            show this help message and exit
+  --refresh-lock        Ignore the existing lockfile, re-resolve every
+                        transitive version from scratch against the committed
+                        .mpm source declarations, and overwrite .mpm.lock with
+                        the new state.
+  --refresh-lock-source NAME
+                        Re-resolve exactly one top-level source's full chain
+                        from the committed .mpm while preserving every other
+                        source's lockfile entries verbatim. NAME may be a
+                        source name (the MPM_SOURCE_<name> key) or a catalog
+                        entry name resolved via derive_source_name.
+  --reconcile           Opt in to the lenient npm-install reconcile when .mpm
+                        and .mpm.lock have drifted. By default a drifted pair
+                        fails fast (exit 1) without mutating the lock. With
+                        this flag, mpm prunes orphaned lock entries, re-
+                        resolves added or changed sources, replays unchanged
+                        sources, and rewrites .mpm.lock on success. Use
+                        --refresh-lock to rebuild the entire lock from scratch
+                        instead.
+  --strict-lock         Upgrade orphaned lock entries to a hard error in the
+                        consistent state. An orphaned lock entry is a source
+                        present in .mpm.lock but absent from .mpm (e.g. after
+                        'mpm remove'). Drift between .mpm and .mpm.lock
+                        already fails fast by default; this flag additionally
+                        fails on an orphan that survives a mpm_hash match.
+                        Remediation: restore the missing MPM_SOURCE_<name>_*
+                        triples in .mpm, or run with --reconcile to prune.
+  --strict-drift        Upgrade branch drift to a hard error in the consistent
+                        state. Branch drift occurs when the lockfile records a
+                        SHA for a branch-shaped source but the branch's
+                        current tip on the remote is a different SHA. Without
+                        this flag, the locked SHA is reused and an info-line
+                        is emitted (the content pin is replayed). With this
+                        flag, mpm exits with an error listing every drifted
+                        source. Remediation: run 'mpm install --refresh-lock-
+                        source <source>' to accept the new branch tip.
+  --lock-file PATH      Path to the lock file. Defaults to <mpm-file>.lock
+                        (derived from --mpm-file). The MPM_LOCK_FILE
+                        environment variable is consulted when this flag is
+                        absent; the CLI flag takes precedence when both are
+                        set.
+
+Example:
+  mpm install           # auto-discovers .mpm
+  mpm install .mpm    # explicit path

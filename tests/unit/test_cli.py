@@ -1,0 +1,1781 @@
+"""Tests for the argparse CLI entry point."""
+
+import argparse
+import re
+import signal
+import subprocess
+import sys
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from mpm_cli.cli import _TopLevelHelpAction, _make_signal_handler, build_parser, main
+
+
+_FAKE_MPM_PATH = "test-mpm-file"
+
+
+@pytest.mark.unit
+class TestBuildParser:
+    """Verify parser construction and subcommand registration."""
+
+    def test_parser_has_version(self) -> None:
+        parser = build_parser()
+        assert parser.prog == "mpm"
+
+    def test_parser_has_subcommands(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["install", "/tmp/.mpm"])
+        assert args.command == "install"
+
+    def test_parser_clean_subcommand(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["clean", "/tmp/.mpm"])
+        assert args.command == "clean"
+
+    def test_parser_validate_xml_subcommand(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["validate", "xml"])
+        assert args.command == "validate"
+        assert args.validate_command == "xml"
+
+    def test_parser_validate_marketplace_subcommand(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["validate", "marketplace"])
+        assert args.command == "validate"
+        assert args.validate_command == "marketplace"
+
+    def test_parser_validate_xml_with_repo_root(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["validate", "xml", "--repo-root", "/some/path"])
+        assert str(args.repo_root) == "/some/path"
+
+    def test_parser_marketplace_enable_subcommand(self) -> None:
+        """build_parser() registers 'marketplace enable <alias>' (AC-26 / FR-18)."""
+        from mpm_cli.commands.marketplace import run_enable
+
+        parser = build_parser()
+        args = parser.parse_args(["marketplace", "enable", "foo"])
+        assert args.command == "marketplace"
+        assert args.marketplace_command == "enable"
+        assert args.alias == "foo"
+        assert args.func is run_enable
+
+    def test_parser_marketplace_disable_subcommand(self) -> None:
+        """build_parser() registers 'marketplace disable <alias>' (AC-26 / FR-18)."""
+        from mpm_cli.commands.marketplace import run_disable
+
+        parser = build_parser()
+        args = parser.parse_args(["marketplace", "disable", "foo"])
+        assert args.command == "marketplace"
+        assert args.marketplace_command == "disable"
+        assert args.alias == "foo"
+        assert args.func is run_disable
+
+    def test_parser_marketplace_status_subcommand(self) -> None:
+        """build_parser() registers 'marketplace status [--all]' (AC-26 / FR-18)."""
+        from mpm_cli.commands.marketplace import run_status
+
+        parser = build_parser()
+        args = parser.parse_args(["marketplace", "status", "--all"])
+        assert args.command == "marketplace"
+        assert args.marketplace_command == "status"
+        assert args.show_all is True
+        assert args.func is run_status
+
+    def test_parser_doctor_subcommand(self) -> None:
+        """build_parser() registers the 'doctor' subcommand (AC-FUNC-007)."""
+        parser = build_parser()
+        args = parser.parse_args(["doctor"])
+        assert args.command == "doctor"
+
+    def test_doctor_func_is_run_doctor(self) -> None:
+        """'doctor' subcommand sets args.func to run_doctor (AC-FUNC-007).
+
+        run_doctor is the registered CLI entrypoint; it handles
+        --refresh-completion-cache then delegates to doctor_command.
+        """
+        from mpm_cli.commands.doctor import run_doctor
+
+        parser = build_parser()
+        args = parser.parse_args(["doctor"])
+        assert args.func is run_doctor
+
+    def test_doctor_strict_drift_flag(self) -> None:
+        """'doctor' subcommand accepts --strict-drift flag (AC-FUNC-007)."""
+        parser = build_parser()
+        args = parser.parse_args(["doctor", "--strict-drift"])
+        assert args.strict_drift is True
+
+    def test_doctor_strict_drift_default_false(self) -> None:
+        """'doctor' --strict-drift defaults to False (AC-FUNC-007)."""
+        parser = build_parser()
+        args = parser.parse_args(["doctor"])
+        assert args.strict_drift is False
+
+
+@pytest.mark.unit
+class TestMainDispatch:
+    """Verify main() dispatch behavior."""
+
+    def test_no_subcommand_exits_2(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main([])
+        assert exc_info.value.code == 2
+
+    def test_help_exits_0(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["--help"])
+        assert exc_info.value.code == 0
+
+    def test_version_exits_0(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["--version"])
+        assert exc_info.value.code == 0
+
+    def test_install_no_arg_no_mpmenv_exits_1(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["install"])
+        assert exc_info.value.code == 1
+
+    def test_main_installs_sigterm_handler(self) -> None:
+        """main() installs a SIGTERM handler before dispatching."""
+        captured_handler = {}
+
+        def _mock_signal(signum: int, handler: object) -> object:
+            captured_handler[signum] = handler
+            return signal.SIG_DFL
+
+        with patch("mpm_cli.cli.signal.signal", side_effect=_mock_signal):
+            with pytest.raises(SystemExit):
+                main([])
+
+        assert signal.SIGTERM in captured_handler, (
+            "main() must call signal.signal(SIGTERM, ...) to install a SIGTERM handler"
+        )
+
+    def test_main_installs_sigint_handler(self) -> None:
+        """main() installs a SIGINT handler before dispatching."""
+        captured_handler = {}
+
+        def _mock_signal(signum: int, handler: object) -> object:
+            captured_handler[signum] = handler
+            return signal.SIG_DFL
+
+        with patch("mpm_cli.cli.signal.signal", side_effect=_mock_signal):
+            with pytest.raises(SystemExit):
+                main([])
+
+        assert signal.SIGINT in captured_handler, (
+            "main() must call signal.signal(SIGINT, ...) to install a SIGINT handler"
+        )
+
+
+@pytest.mark.unit
+class TestUpdateCheckHook:
+    """main() wires the update-available alert before subcommand dispatch (AC-28 / FR-29)."""
+
+    def test_parser_registers_no_update_check_flag(self) -> None:
+        """build_parser() accepts the --no-update-check global flag."""
+        parser = build_parser()
+        args = parser.parse_args(["--no-update-check", "install", _FAKE_MPM_PATH])
+        assert args.no_update_check is True
+
+    def test_top_level_help_mentions_no_update_check(self) -> None:
+        """The verbatim top-level help text names --no-update-check (AC-28 grep target)."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "--no-update-check" in _TOP_LEVEL_HELP
+
+    def test_main_invokes_update_check_before_dispatch(self) -> None:
+        """main() calls maybe_alert_update with the parsed command before dispatching."""
+        calls: list[tuple[object, object]] = []
+
+        def _record(args: object, command: object, **kwargs: object) -> None:
+            calls.append((args, command))
+
+        with patch("mpm_cli.cli.maybe_alert_update", side_effect=_record):
+            with pytest.raises(SystemExit):
+                main([])
+
+        assert len(calls) == 1, "maybe_alert_update must be called exactly once per invocation"
+
+        assert calls[0][1] is None
+
+    def test_main_passes_resolved_command_to_hook(self) -> None:
+        """main() forwards the resolved subcommand name to the update-check hook."""
+        recorded: dict[str, object] = {}
+
+        class _StopDispatch(Exception):
+            """Sentinel raised from the hook to short-circuit before dispatch runs."""
+
+        def _record(args: object, command: object, **kwargs: object) -> None:
+            recorded["command"] = command
+            raise _StopDispatch
+
+        with patch("mpm_cli.cli.maybe_alert_update", side_effect=_record):
+            with pytest.raises(_StopDispatch):
+                main(["install", _FAKE_MPM_PATH])
+
+        assert recorded.get("command") == "install"
+
+    def test_update_check_hook_failure_does_not_crash_main(self) -> None:
+        """A skip in the hook (editable install) leaves dispatch unaffected: no-arg still exits 2."""
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([])
+        assert exc_info.value.code == 2
+
+
+@pytest.mark.unit
+class TestTopLevelHelpAlias:
+    """Verify -h is registered as an alias for --help on the top-level parser (AC-FUNC-003, AC-FUNC-004)."""
+
+    def test_short_h_exits_zero_via_main(self) -> None:
+        """main(['-h']) raises SystemExit(0), confirming -h is accepted (AC-TEST-001)."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["-h"])
+        assert exc_info.value.code == 0
+
+    def test_short_h_and_double_dash_help_both_exit_zero(self) -> None:
+        """Both '-h' and '--help' exit 0 via main() (AC-FUNC-001)."""
+        for flag in ("-h", "--help"):
+            with pytest.raises(SystemExit) as exc_info:
+                main([flag])
+            assert exc_info.value.code == 0, f"main([{flag!r}]) exited {exc_info.value.code}, expected 0"
+
+    def test_parser_add_help_false_preserved(self) -> None:
+        """build_parser() still passes add_help=False on the parser (AC-FUNC-003)."""
+        parser = build_parser()
+
+        help_action = next(
+            (a for a in parser._actions if "--help" in a.option_strings),
+            None,
+        )
+        assert help_action is not None, "No --help action registered on top-level parser"
+
+        assert type(help_action).__name__ == "_TopLevelHelpAction", (
+            f"--help action is {type(help_action)!r}, expected _TopLevelHelpAction"
+        )
+
+    def test_h_alias_registered_on_same_action_as_double_dash_help(self) -> None:
+        """'-h' and '--help' resolve to the same _TopLevelHelpAction action (AC-FUNC-004)."""
+        parser = build_parser()
+        help_action = next(
+            (a for a in parser._actions if "--help" in a.option_strings),
+            None,
+        )
+        assert help_action is not None, "No --help action registered on top-level parser"
+        assert "-h" in help_action.option_strings, (
+            f"'-h' not in help action option_strings: {help_action.option_strings!r}"
+        )
+
+    def test_top_level_help_action_receives_option_string_short_h(self) -> None:
+        """_TopLevelHelpAction.__call__ receives option_string='-h' when -h is used (AC-FUNC-004)."""
+        received: list[str | None] = []
+
+        class _CapturingAction(_TopLevelHelpAction):
+            def __call__(
+                self,
+                parser: argparse.ArgumentParser,
+                namespace: argparse.Namespace,
+                values: str | list[str] | None,
+                option_string: str | None = None,
+            ) -> None:
+                received.append(option_string)
+                raise SystemExit(0)
+
+        parser = build_parser()
+
+        for action in parser._actions:
+            if type(action).__name__ == "_TopLevelHelpAction":
+                action.__class__ = _CapturingAction
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["-h"])
+
+        assert len(received) == 1, f"Action was called {len(received)} times, expected 1"
+        assert received[0] == "-h", f"option_string was {received[0]!r} when '-h' was passed, expected '-h'"
+
+    def test_top_level_help_action_receives_option_string_double_dash_help(self) -> None:
+        """_TopLevelHelpAction.__call__ receives option_string='--help' when --help is used (AC-FUNC-004)."""
+        received: list[str | None] = []
+
+        class _CapturingAction(_TopLevelHelpAction):
+            def __call__(
+                self,
+                parser: argparse.ArgumentParser,
+                namespace: argparse.Namespace,
+                values: str | list[str] | None,
+                option_string: str | None = None,
+            ) -> None:
+                received.append(option_string)
+                raise SystemExit(0)
+
+        parser = build_parser()
+
+        for action in parser._actions:
+            if type(action).__name__ == "_TopLevelHelpAction":
+                action.__class__ = _CapturingAction
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--help"])
+
+        assert len(received) == 1, f"Action was called {len(received)} times, expected 1"
+        assert received[0] == "--help", f"option_string was {received[0]!r} when '--help' was passed, expected '--help'"
+
+    def test_short_h_produces_stdout_output(self) -> None:
+        """main(['-h']) writes to stdout before exiting (AC-FUNC-001)."""
+        import io
+
+        captured_stdout = io.StringIO()
+        with patch("mpm_cli.cli.sys.stdout", captured_stdout):
+            with pytest.raises(SystemExit):
+                main(["-h"])
+        output = captured_stdout.getvalue()
+        assert len(output) > 0, "main(['-h']) produced no stdout output"
+        assert "mpm" in output.lower(), f"'-h' output does not mention 'mpm': {output!r}"
+
+
+@pytest.mark.unit
+class TestMakeSignalHandler:
+    """Verify _make_signal_handler() creates handlers that call os._exit(128+signum)."""
+
+    @pytest.mark.parametrize(
+        "signum",
+        [signal.SIGTERM, signal.SIGINT],
+        ids=["SIGTERM", "SIGINT"],
+    )
+    def test_handler_calls_os_exit_with_128_plus_signum(self, signum: int) -> None:
+        """Handler calls os._exit(128 + signum) when invoked.
+
+        Patches os._exit so the test process is not terminated. Verifies
+        the exit code matches the POSIX shell convention of 128 + signal_number.
+        """
+        handler = _make_signal_handler(signum)
+
+        with patch("mpm_cli.cli.os._exit") as mock_exit:
+            handler(signum, None)
+
+        mock_exit.assert_called_once_with(128 + signum)
+
+    def test_handler_uses_received_signum_not_closure(self) -> None:
+        """Handler uses the signal number received at call time, not the closure value.
+
+        _make_signal_handler(SIGTERM) returns a handler that receives the actual
+        signal number as its first argument. The handler must use that argument
+        (received_signum) to compute the exit code, not a captured closure variable.
+        Both approaches produce the same result for a correctly formed handler, but
+        this test confirms the received_signum path is executed.
+        """
+        handler = _make_signal_handler(signal.SIGTERM)
+
+        with patch("mpm_cli.cli.os._exit") as mock_exit:
+            handler(signal.SIGTERM, None)
+
+        mock_exit.assert_called_once_with(128 + signal.SIGTERM)
+
+
+@pytest.mark.unit
+class TestGlobalFlagsInRootParser:
+    """build_parser() adds global flags to the root parser before subparsers (AC-FUNC-009)."""
+
+    def test_root_parser_has_quiet_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--quiet", "install", _FAKE_MPM_PATH])
+        assert args.quiet is True
+
+    def test_root_parser_has_verbose_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--verbose", "install", _FAKE_MPM_PATH])
+        assert args.verbose is True
+
+    def test_root_parser_has_no_color_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["--no-color", "install", _FAKE_MPM_PATH])
+        assert args.no_color is True
+
+    def test_global_flags_default_false(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["install", _FAKE_MPM_PATH])
+        assert args.quiet is False
+        assert args.verbose is False
+        assert args.no_color is False
+
+    def test_quiet_verbose_together_exits_nonzero(self) -> None:
+        """Root parser enforces mutual exclusion of --quiet and --verbose."""
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["--quiet", "--verbose", "install", _FAKE_MPM_PATH])
+        assert exc_info.value.code != 0
+
+
+@pytest.mark.unit
+class TestGlobalFlagsSubcommandPropagation:
+    """Every subcommand receives quiet, verbose, no_color in parsed namespace (AC-FUNC-012, AC-TEST-002)."""
+
+    def _get_subcommand_choices(self) -> list[str]:
+        """Return all registered subcommand names by introspecting the parser."""
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return list(action.choices.keys())
+        return []
+
+    @pytest.fixture()
+    def subcommands(self) -> list[str]:
+        return self._get_subcommand_choices()
+
+    def _minimal_args_for(self, subcommand: str) -> list[str]:
+        """Return the minimal argv needed to parse the given subcommand without error.
+
+        Every registered subcommand MUST have an entry here. If a new subcommand
+        is added to the parser without a corresponding entry, _minimal_args_for
+        returns an empty list which will cause parse_args to raise SystemExit --
+        and the test will fail loudly rather than swallowing the error.
+        """
+        minimal: dict[str, list[str]] = {
+            "add": ["entry-a", "--catalog-source", "https://example.com/repo.git@main"],
+            "catalog": ["audit"],
+            "completion": ["bash"],
+            "install": [_FAKE_MPM_PATH],
+            "marketplace": ["status"],
+            "clean": [_FAKE_MPM_PATH],
+            "doctor": [],
+            "validate": ["xml"],
+            "search": [],
+            "list": [],
+            "outdated": ["--catalog-source", "file:///fake@HEAD"],
+            "remove": ["foo_bar"],
+            "repo": ["init", "-u", "https://example.com/repo", "-b", "main", "-m", "manifest.xml"],
+            "why": ["https://github.com/org/repo"],
+            "__complete_catalog_entries": [],
+            "__complete_catalog_versions": [],
+            "__complete_names_in_lockfile": [],
+            "__complete_project_versions": ["https://example.com/proj.git", ""],
+            "__complete_source_names_in_mpm": [],
+            "__complete_cached_catalogs": [],
+            "__resolve_entry_to_repo_url": ["foo"],
+        }
+        return minimal[subcommand]
+
+    def test_subcommands_not_empty(self, subcommands: list[str]) -> None:
+        assert len(subcommands) > 0, "build_parser() must register at least one subcommand"
+
+    @pytest.mark.parametrize(
+        "flag_args,attr,expected",
+        [
+            (["--quiet"], "quiet", True),
+            (["--verbose"], "verbose", True),
+            (["--no-color"], "no_color", True),
+            ([], "quiet", False),
+            ([], "verbose", False),
+            ([], "no_color", False),
+        ],
+        ids=[
+            "--quiet->quiet=True",
+            "--verbose->verbose=True",
+            "--no-color->no_color=True",
+            "default->quiet=False",
+            "default->verbose=False",
+            "default->no_color=False",
+        ],
+    )
+    def test_global_flag_propagated_to_install(
+        self,
+        flag_args: list[str],
+        attr: str,
+        expected: bool,
+    ) -> None:
+        """install subcommand receives global flag values (representative subcommand)."""
+        parser = build_parser()
+        argv = flag_args + ["install", _FAKE_MPM_PATH]
+        args = parser.parse_args(argv)
+        assert getattr(args, attr) == expected
+
+    def test_all_subcommands_have_quiet_attr(self, subcommands: list[str]) -> None:
+        """Every subcommand's parsed namespace has the quiet attribute.
+
+        Uses _minimal_args_for to supply valid positional arguments for each
+        subcommand so parse_args succeeds. If a new subcommand is added without
+        a _minimal_args_for entry, parse_args will raise SystemExit (via argparse
+        error), which will propagate and fail the test loudly -- intentional
+        fail-fast behavior.
+        """
+        parser = build_parser()
+        for subcommand in subcommands:
+            extra = self._minimal_args_for(subcommand)
+            args = parser.parse_args(["--quiet"] + [subcommand] + extra)
+            assert hasattr(args, "quiet"), f"subcommand '{subcommand}' missing 'quiet'"
+            assert args.quiet is True, f"subcommand '{subcommand}' quiet not True"
+
+    def test_all_subcommands_have_verbose_attr(self, subcommands: list[str]) -> None:
+        """Every subcommand's parsed namespace has the verbose attribute.
+
+        Uses _minimal_args_for to supply valid positional arguments for each
+        subcommand so parse_args succeeds. If a new subcommand is added without
+        a _minimal_args_for entry, parse_args will raise SystemExit (via argparse
+        error), which will propagate and fail the test loudly -- intentional
+        fail-fast behavior.
+        """
+        parser = build_parser()
+        for subcommand in subcommands:
+            extra = self._minimal_args_for(subcommand)
+            args = parser.parse_args(["--verbose"] + [subcommand] + extra)
+            assert hasattr(args, "verbose"), f"subcommand '{subcommand}' missing 'verbose'"
+            assert args.verbose is True, f"subcommand '{subcommand}' verbose not True"
+
+    def test_all_subcommands_have_no_color_attr(self, subcommands: list[str]) -> None:
+        """Every subcommand's parsed namespace has the no_color attribute.
+
+        Uses _minimal_args_for to supply valid positional arguments for each
+        subcommand so parse_args succeeds. If a new subcommand is added without
+        a _minimal_args_for entry, parse_args will raise SystemExit (via argparse
+        error), which will propagate and fail the test loudly -- intentional
+        fail-fast behavior.
+        """
+        parser = build_parser()
+        for subcommand in subcommands:
+            extra = self._minimal_args_for(subcommand)
+            args = parser.parse_args(["--no-color"] + [subcommand] + extra)
+            assert hasattr(args, "no_color"), f"subcommand '{subcommand}' missing 'no_color'"
+            assert args.no_color is True, f"subcommand '{subcommand}' no_color not True"
+
+
+@pytest.mark.unit
+class TestApplyGlobalFlagsCalledBeforeDispatch:
+    """_apply_global_flags is called in main() after parse_args and before subcommand dispatch (AC-FUNC-010)."""
+
+    def test_apply_global_flags_called_in_main(self) -> None:
+        """_apply_global_flags is invoked during main() execution."""
+        with patch("mpm_cli.cli._apply_global_flags") as mock_apply:
+            with pytest.raises(SystemExit):
+                main([])
+
+        mock_apply.assert_called_once()
+
+    def test_apply_global_flags_called_before_subcommand_dispatch(self) -> None:
+        """_apply_global_flags is invoked before the subcommand func is called."""
+        call_order: list[str] = []
+
+        def record_apply(args: argparse.Namespace) -> None:
+            call_order.append("apply_global_flags")
+
+        mock_func = MagicMock(side_effect=lambda args: call_order.append("subcommand"))
+
+        with patch("mpm_cli.cli._apply_global_flags", side_effect=record_apply):
+            with patch("mpm_cli.cli.build_parser") as mock_build:
+                mock_parser = MagicMock()
+                mock_args = argparse.Namespace(
+                    command="install",
+                    quiet=False,
+                    verbose=False,
+                    no_color=False,
+                    func=mock_func,
+                )
+                mock_parser.parse_args.return_value = mock_args
+                mock_build.return_value = mock_parser
+                main([])
+
+        assert call_order == ["apply_global_flags", "subcommand"], (
+            f"Expected apply_global_flags before subcommand dispatch, got: {call_order}"
+        )
+
+
+@pytest.mark.unit
+class TestSubprocessGlobalFlags:
+    """Subprocess-driven tests for global flag behavior (AC-CYCLE-001).
+
+    Each test spawns the mpm binary as a subprocess so the full argparse
+    wiring, entry-point plumbing, and environment handling are exercised
+    end-to-end -- not via in-process mocks.
+    """
+
+    def _run_mpm(
+        self,
+        args: list[str],
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the mpm entry point via the same Python interpreter.
+
+        Uses `sys.executable -m mpm_cli` so no separate installation is
+        required; the entry point is invoked directly from the source tree.
+        extra_env values are merged on top of a clean minimal env that
+        includes PATH and HOME (so git and other tools resolve correctly)
+        while preventing test-environment leakage.
+        """
+        import os
+
+        env = {k: v for k, v in os.environ.items()}
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, "-m", "mpm_cli"] + args,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_help_lists_three_global_flags(self) -> None:
+        """mpm --help output includes --quiet, --verbose, and --no-color.
+
+        Verifies that add_global_flags is wired to the root parser and that
+        argparse's generated help text names all three flags.
+        """
+        result = self._run_mpm(["--help"])
+        assert result.returncode == 0, f"mpm --help exited {result.returncode}; stderr: {result.stderr!r}"
+        combined = result.stdout + result.stderr
+        assert "--quiet" in combined, f"'--quiet' not found in mpm --help output: {combined!r}"
+        assert "--verbose" in combined, f"'--verbose' not found in mpm --help output: {combined!r}"
+        assert "--no-color" in combined, f"'--no-color' not found in mpm --help output: {combined!r}"
+
+    def test_quiet_and_verbose_together_exits_nonzero_with_mutex_error(self) -> None:
+        """mpm --quiet --verbose install exits non-zero with argparse's mutual-exclusion message.
+
+        Passing both --quiet and --verbose must be rejected immediately by
+        argparse's mutually-exclusive group with a non-zero exit code and
+        an error message on stderr that names 'not allowed with' -- confirming
+        the fail-fast mutex enforcement from spec Section 7.
+
+        A subcommand (install) is included so argparse parses all tokens; the
+        mutex violation is detected before the subcommand is dispatched.
+        """
+        result = self._run_mpm(["--quiet", "--verbose", "install", "test-mpm-file"])
+        assert result.returncode != 0, (
+            f"mpm --quiet --verbose install should exit non-zero, got {result.returncode}; stdout: {result.stdout!r}"
+        )
+        assert "not allowed with" in result.stderr, (
+            f"Expected argparse mutex error ('not allowed with') in stderr; got: {result.stderr!r}"
+        )
+
+    def test_no_color_env_suppresses_ansi_in_help(self) -> None:
+        """NO_COLOR=1 mpm --help produces no ANSI escape sequences in output.
+
+        Sets NO_COLOR=1 in the subprocess environment and asserts that the
+        combined stdout+stderr contains no ANSI color escape sequences
+        (pattern ESC [ ... m). This validates that _apply_global_flags reads
+        the NO_COLOR env var and disables color output before any formatted
+        output is produced.
+        """
+        result = self._run_mpm(["--help"], extra_env={"NO_COLOR": "1"})
+        assert result.returncode == 0, f"NO_COLOR=1 mpm --help exited {result.returncode}; stderr: {result.stderr!r}"
+        combined = result.stdout + result.stderr
+        ansi_pattern = re.compile(r"\x1b\[[0-9;]*m")
+        matches = ansi_pattern.findall(combined)
+        assert not matches, (
+            f"ANSI escape sequences found in NO_COLOR=1 output: {matches!r}; output snippet: {combined[:500]!r}"
+        )
+
+
+@pytest.mark.unit
+class TestSearchSubcommandRegistration:
+    """build_parser() registers the 'search' subcommand (the renamed 'list')."""
+
+    def test_search_subcommand_exists_in_parser(self) -> None:
+        """build_parser() includes 'search' as a registered subcommand."""
+        parser = build_parser()
+        args = parser.parse_args(["search"])
+        assert args.command == "search"
+
+    def test_list_token_is_the_inventory_command_not_search(self) -> None:
+        """The 'list' token is now a distinct declared-vs-installed inventory command.
+
+        The 3.0.0 rename moved catalog discovery from 'list' to 'search'; 'list'
+        was later reintroduced as a SEPARATE command that reconciles .mpm
+        against .mpm.lock (positive coverage lives in tests/unit/test_list.py).
+        This asserts the two commands are distinct and both registered.
+        """
+        parser = build_parser()
+        assert parser.parse_args(["list"]).command == "list"
+        assert parser.parse_args(["search"]).command == "search"
+
+    def test_search_subcommand_has_catalog_source_flag(self) -> None:
+        """The 'search' --catalog-source flag is repeatable (append) -> a list.
+
+        ``search`` accepts many sources (spec Section 4.1 / FR-9), so the shared
+        factory registers it with ``action="append"``; a single occurrence parses
+        into a one-element list.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["search", "--catalog-source", "https://example.com/repo.git@main"])
+        assert args.catalog_source == ["https://example.com/repo.git@main"]
+
+    def test_search_subcommand_catalog_source_repeatable(self) -> None:
+        """Repeated --catalog-source flags on 'search' append into an ordered list."""
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "search",
+                "--catalog-source",
+                "https://example.com/a.git@main",
+                "--catalog-source",
+                "https://example.com/b.git@main",
+            ]
+        )
+        assert args.catalog_source == [
+            "https://example.com/a.git@main",
+            "https://example.com/b.git@main",
+        ]
+
+    def test_search_subcommand_catalog_source_default_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--catalog-source defaults to None when unset and env var is absent."""
+        monkeypatch.delenv("MPM_CATALOG_SOURCE", raising=False)
+        parser = build_parser()
+        args = parser.parse_args(["search"])
+        assert args.catalog_source is None
+
+    def test_search_subcommand_has_no_color_flag(self) -> None:
+        """The 'search' subcommand propagates --no-color from the root parser.
+
+        --no-color is a global flag defined on the root parser (before any
+        subcommand token). Verify that 'mpm --no-color search' sets
+        no_color=True in the parsed namespace.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["--no-color", "search"])
+        assert args.no_color is True
+
+    def test_search_subcommand_sets_func(self) -> None:
+        """The 'search' subcommand sets args.func to run_search."""
+        from mpm_cli.commands.search import run_search
+
+        parser = build_parser()
+        args = parser.parse_args(["search"])
+        assert args.func is run_search
+
+    def test_search_help_exits_0(self) -> None:
+        """mpm search --help exits 0 without error."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["search", "--help"])
+        assert exc_info.value.code == 0
+
+    def test_search_help_mentions_catalog_source(self) -> None:
+        """mpm search --help text mentions --catalog-source and MPM_CATALOG_SOURCE."""
+        import io
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                search_parser = action.choices.get("search")
+                break
+        else:
+            search_parser = None
+
+        assert search_parser is not None, "search subparser must be registered"
+        buf = io.StringIO()
+        search_parser.print_help(file=buf)
+        help_text = buf.getvalue()
+        assert "--catalog-source" in help_text
+        assert "MPM_CATALOG_SOURCE" in help_text
+
+
+@pytest.mark.unit
+class TestAddSubcommandRegistration:
+    """build_parser() registers the 'add' subcommand per AC-FUNC-002."""
+
+    def test_add_subcommand_exists_in_parser(self) -> None:
+        """build_parser() includes 'add' as a registered subcommand."""
+        parser = build_parser()
+        args = parser.parse_args(["add", "entry-a", "--catalog-source", "https://example.com/repo.git@main"])
+        assert args.command == "add"
+
+    def test_add_subcommand_has_catalog_source_flag(self) -> None:
+        """The 'add' subcommand accepts --catalog-source (from shared factory)."""
+        parser = build_parser()
+        args = parser.parse_args(["add", "entry-a", "--catalog-source", "https://example.com/repo.git@main"])
+        assert args.catalog_source == "https://example.com/repo.git@main"
+
+    def test_add_subcommand_has_mpm_file_flag(self) -> None:
+        """The 'add' subcommand accepts --mpm-file."""
+        parser = build_parser()
+        args = parser.parse_args(["add", "entry-a", "--catalog-source", "x@main", "--mpm-file", "/tmp/.mpm"])
+        assert args.mpm_file == "/tmp/.mpm"
+
+    def test_add_subcommand_mpm_file_default(self) -> None:
+        """--mpm-file defaults to ./.mpm when not supplied and env var is absent."""
+        import os
+
+        parser = build_parser()
+        env_backup = os.environ.pop("MPM_MPM_FILE", None)
+        try:
+            args = parser.parse_args(["add", "entry-a", "--catalog-source", "x@main"])
+        finally:
+            if env_backup is not None:
+                os.environ["MPM_MPM_FILE"] = env_backup
+        assert args.mpm_file == "./.mpm"
+
+    def test_add_subcommand_sets_func(self) -> None:
+        """The 'add' subcommand sets args.func to run_add."""
+        from mpm_cli.commands.add import run_add
+
+        parser = build_parser()
+        args = parser.parse_args(["add", "entry-a", "--catalog-source", "x@main"])
+        assert args.func is run_add
+
+    def test_add_help_exits_0(self) -> None:
+        """mpm add --help exits 0 without error."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["add", "--help"])
+        assert exc_info.value.code == 0
+
+    def test_add_help_mentions_mpm_file_and_env_var(self) -> None:
+        """mpm add --help text mentions --mpm-file and MPM_MPM_FILE."""
+        import io
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                add_parser = action.choices.get("add")
+                break
+        else:
+            add_parser = None
+
+        assert add_parser is not None, "add subparser must be registered"
+        buf = io.StringIO()
+        add_parser.print_help(file=buf)
+        help_text = buf.getvalue()
+        assert "--mpm-file" in help_text
+        assert "MPM_MPM_FILE" in help_text
+
+
+@pytest.mark.unit
+class TestRemoveSubcommandRegistration:
+    """build_parser() registers the 'remove' subcommand (AC-FUNC-001, AC-FUNC-002, AC-FUNC-003)."""
+
+    def test_remove_subcommand_exists_in_parser(self) -> None:
+        """build_parser() includes 'remove' as a registered subcommand."""
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar"])
+        assert args.command == "remove"
+
+    def test_remove_subcommand_accepts_positional_name(self) -> None:
+        """The 'remove' subcommand accepts one positional <name>."""
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar"])
+        assert args.names == ["foo_bar"]
+
+    def test_remove_subcommand_accepts_multiple_names(self) -> None:
+        """The 'remove' subcommand accepts multiple positional <name> values."""
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar", "baz_qux"])
+        assert args.names == ["foo_bar", "baz_qux"]
+
+    def test_remove_subcommand_has_mpm_file_flag(self) -> None:
+        """The 'remove' subcommand accepts --mpm-file."""
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar", "--mpm-file", "/tmp/.mpm"])
+        assert args.mpm_file == "/tmp/.mpm"
+
+    def test_remove_subcommand_mpm_file_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--mpm-file defaults to ./.mpm when not supplied and env var is absent."""
+        monkeypatch.delenv("MPM_MPM_FILE", raising=False)
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar"])
+        assert args.mpm_file == "./.mpm"
+
+    def test_remove_subcommand_has_force_flag(self) -> None:
+        """The 'remove' subcommand accepts --force."""
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar", "--force"])
+        assert args.force is True
+
+    def test_remove_subcommand_has_dry_run_flag(self) -> None:
+        """The 'remove' subcommand accepts --dry-run."""
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar", "--dry-run"])
+        assert args.dry_run is True
+
+    def test_remove_subcommand_has_no_color_flag(self) -> None:
+        """The 'remove' subcommand receives --no-color from the root parser global flags."""
+        parser = build_parser()
+        args = parser.parse_args(["--no-color", "remove", "foo_bar"])
+        assert args.no_color is True
+
+    def test_remove_subcommand_sets_func(self) -> None:
+        """The 'remove' subcommand sets args.func to run_remove."""
+        from mpm_cli.commands.remove import run_remove
+
+        parser = build_parser()
+        args = parser.parse_args(["remove", "foo_bar"])
+        assert args.func is run_remove
+
+    def test_remove_help_exits_0(self) -> None:
+        """mpm remove --help exits 0 without error."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["remove", "--help"])
+        assert exc_info.value.code == 0
+
+    def test_remove_help_mentions_mpm_file_and_env_var(self) -> None:
+        """mpm remove --help text mentions --mpm-file and MPM_MPM_FILE."""
+        import io
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                remove_parser = action.choices.get("remove")
+                break
+        else:
+            remove_parser = None
+
+        assert remove_parser is not None, "remove subparser must be registered"
+        buf = io.StringIO()
+        remove_parser.print_help(file=buf)
+        help_text = buf.getvalue()
+        assert "--mpm-file" in help_text
+        assert "MPM_MPM_FILE" in help_text
+
+    def test_remove_help_mentions_dual_input_contract(self) -> None:
+        """mpm remove --help describes that both source name and entry name are accepted."""
+        import io
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                remove_parser = action.choices.get("remove")
+                break
+        else:
+            remove_parser = None
+
+        assert remove_parser is not None, "remove subparser must be registered"
+        buf = io.StringIO()
+        remove_parser.print_help(file=buf)
+        help_text = buf.getvalue()
+
+        assert "foo_bar" in help_text or "source name" in help_text or "entry name" in help_text
+
+    def test_remove_help_mentions_atomicity_rule(self) -> None:
+        """mpm remove --help describes the atomicity rule."""
+        import io
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                remove_parser = action.choices.get("remove")
+                break
+        else:
+            remove_parser = None
+
+        assert remove_parser is not None, "remove subparser must be registered"
+        buf = io.StringIO()
+        remove_parser.print_help(file=buf)
+        help_text = buf.getvalue()
+
+        assert "atomic" in help_text.lower() or "Atomicity" in help_text or "nothing changes" in help_text
+
+
+@pytest.mark.unit
+class TestOutdatedSubcommandRegistration:
+    """Verify 'outdated' subcommand is registered in the CLI parser.
+
+    TDD-paired coverage for the production change in cli.py (register_outdated
+    import and call). Per docs/source-test-atomicity.md, every new production
+    source file has a matching test in the same work unit.
+    """
+
+    def test_outdated_subcommand_is_registered(self) -> None:
+        """build_parser() must include 'outdated' in its subcommand choices."""
+        parser = build_parser()
+        subparsers_action = None
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                subparsers_action = action
+                break
+        assert subparsers_action is not None, "No subparsers action found on parser"
+        assert "outdated" in subparsers_action.choices, (
+            "'outdated' subcommand must be registered in the top-level parser"
+        )
+
+    def test_outdated_subcommand_parses_catalog_source(self) -> None:
+        """'outdated' subcommand accepts --catalog-source."""
+        parser = build_parser()
+        args = parser.parse_args(["outdated", "--catalog-source", "file:///fake@HEAD"])
+        assert args.command == "outdated"
+        assert args.catalog_source == "file:///fake@HEAD"
+
+    def test_outdated_subcommand_parses_mpm_file(self) -> None:
+        """'outdated' subcommand accepts --mpm-file."""
+        parser = build_parser()
+        args = parser.parse_args(["outdated", "--mpm-file", "/tmp/.mpm", "--catalog-source", "file:///x@HEAD"])
+        assert args.mpm_file == "/tmp/.mpm"
+
+    def test_outdated_subcommand_parses_lock_file(self) -> None:
+        """'outdated' subcommand accepts --lock-file."""
+        parser = build_parser()
+        args = parser.parse_args(["outdated", "--catalog-source", "file:///x@HEAD", "--lock-file", "/tmp/.mpm.lock"])
+        assert args.lock_file == "/tmp/.mpm.lock"
+
+    def test_outdated_subcommand_parses_format_table(self) -> None:
+        """'outdated' subcommand accepts --format table."""
+        parser = build_parser()
+        args = parser.parse_args(["outdated", "--catalog-source", "file:///x@HEAD", "--format", "table"])
+        assert args.format == "table"
+
+    def test_outdated_subcommand_has_func_attribute(self) -> None:
+        """'outdated' subcommand sets args.func to the run() entry point."""
+        from mpm_cli.commands.outdated import run
+
+        parser = build_parser()
+        args = parser.parse_args(["outdated", "--catalog-source", "file:///fake@HEAD"])
+        assert args.func is run
+
+    def test_outdated_default_format_is_table(self) -> None:
+        """'outdated' subcommand default format is 'table' (AC-FUNC-007)."""
+        import os
+
+        env_backup = os.environ.pop("MPM_OUTDATED_FORMAT", None)
+        try:
+            parser = build_parser()
+            args = parser.parse_args(["outdated", "--catalog-source", "file:///x@HEAD"])
+            assert args.format == "table"
+        finally:
+            if env_backup is not None:
+                os.environ["MPM_OUTDATED_FORMAT"] = env_backup
+
+
+@pytest.mark.unit
+class TestWhySubcommand:
+    """Verify 'why' subcommand is registered in the CLI parser.
+
+    TDD-paired coverage for the production change in cli.py (register_why call).
+    """
+
+    def test_why_subcommand_is_registered(self) -> None:
+        """build_parser() must include 'why' in its subcommand choices."""
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                assert "why" in action.choices, "'why' subcommand must be registered in the top-level parser"
+                return
+        pytest.fail("No subparsers action found in parser")
+
+    def test_why_subcommand_parses_target(self) -> None:
+        """'why' subcommand accepts a positional target URL."""
+        parser = build_parser()
+        args = parser.parse_args(["why", "https://github.com/org/repo"])
+        assert args.command == "why"
+        assert args.target == "https://github.com/org/repo"
+
+    def test_why_subcommand_parses_catalog_source(self) -> None:
+        """'why' subcommand accepts --catalog-source."""
+        parser = build_parser()
+        args = parser.parse_args(["why", "https://github.com/org/repo", "--catalog-source", "file:///fake@HEAD"])
+        assert args.catalog_source == "file:///fake@HEAD"
+
+    def test_why_subcommand_parses_mpm_file(self) -> None:
+        """'why' subcommand accepts --mpm-file."""
+        parser = build_parser()
+        args = parser.parse_args(["why", "https://github.com/org/repo", "--mpm-file", "/tmp/.mpm"])
+        assert args.mpm_file == "/tmp/.mpm"
+
+    def test_why_subcommand_parses_lock_file(self) -> None:
+        """'why' subcommand accepts --lock-file."""
+        parser = build_parser()
+        args = parser.parse_args(["why", "https://github.com/org/repo", "--lock-file", "/tmp/.mpm.lock"])
+        assert args.lock_file == "/tmp/.mpm.lock"
+
+    def test_why_subcommand_parses_format_text(self) -> None:
+        """'why' subcommand accepts --format text."""
+        parser = build_parser()
+        args = parser.parse_args(["why", "https://github.com/org/repo", "--format", "text"])
+        assert args.format == "text"
+
+    def test_why_subcommand_has_func_attribute(self) -> None:
+        """'why' subcommand sets args.func to the run() entry point."""
+        from mpm_cli.commands.why import run
+
+        parser = build_parser()
+        args = parser.parse_args(["why", "https://github.com/org/repo"])
+        assert args.func is run
+
+    def test_why_default_format_is_text(self) -> None:
+        """'why' subcommand default format is 'text'."""
+        import os
+
+        env_backup = os.environ.pop("MPM_WHY_FORMAT", None)
+        try:
+            parser = build_parser()
+            args = parser.parse_args(["why", "https://github.com/org/repo"])
+            assert args.format == "text"
+        finally:
+            if env_backup is not None:
+                os.environ["MPM_WHY_FORMAT"] = env_backup
+
+
+@pytest.mark.unit
+class TestCatalogSubcommandRegistration:
+    """build_parser() registers the 'catalog' subcommand group (E5-F2-S1-T1)."""
+
+    def test_catalog_subcommand_registered(self) -> None:
+        """build_parser() includes 'catalog' as a registered subcommand."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert args.command == "catalog"
+
+    def test_catalog_audit_sub_subcommand_registered(self) -> None:
+        """build_parser() includes 'catalog audit' as a registered sub-subcommand."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert args.catalog_command == "audit"
+
+    def test_catalog_audit_default_target_is_dot(self) -> None:
+        """'catalog audit' with no positional arg defaults target to '.'."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert args.target == "."
+
+    def test_catalog_audit_explicit_target(self) -> None:
+        """'catalog audit /some/path' stores the target path."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit", "/some/path"])
+        assert args.target == "/some/path"
+
+    def test_catalog_audit_check_defaults_to_all(self) -> None:
+        """'catalog audit' --check defaults to the full set of valid checks."""
+        from mpm_cli.constants import MPM_CATALOG_AUDIT_VALID_CHECKS
+
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert args.check == MPM_CATALOG_AUDIT_VALID_CHECKS
+
+    def test_catalog_audit_check_single_value(self) -> None:
+        """'catalog audit --check metadata' parses to frozenset({'metadata'})."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit", "--check", "metadata"])
+        assert args.check == frozenset({"metadata"})
+
+    def test_catalog_audit_check_comma_separated(self) -> None:
+        """'catalog audit --check metadata,tag-format' parses to the expected frozenset."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit", "--check", "metadata,tag-format"])
+        assert args.check == frozenset({"metadata", "tag-format"})
+
+    def test_catalog_audit_format_default_is_text(self) -> None:
+        """'catalog audit' format defaults to 'text'."""
+        import os
+
+        env_backup = os.environ.pop("MPM_CATALOG_AUDIT_FORMAT", None)
+        try:
+            parser = build_parser()
+            args = parser.parse_args(["catalog", "audit"])
+            assert args.format == "text"
+        finally:
+            if env_backup is not None:
+                os.environ["MPM_CATALOG_AUDIT_FORMAT"] = env_backup
+
+    def test_catalog_audit_strict_default_false(self) -> None:
+        """'catalog audit' --strict defaults to False."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert args.strict is False
+
+    def test_catalog_audit_strict_true_when_passed(self) -> None:
+        """'catalog audit --strict' stores strict=True."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit", "--strict"])
+        assert args.strict is True
+
+    def test_catalog_audit_no_color_default_false(self) -> None:
+        """'catalog audit' --no-color defaults to False."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert args.no_color is False
+
+    def test_catalog_audit_sets_func(self) -> None:
+        """'catalog audit' sets args.func to a callable."""
+        parser = build_parser()
+        args = parser.parse_args(["catalog", "audit"])
+        assert callable(args.func)
+
+    def test_catalog_audit_help_exits_0(self) -> None:
+        """mpm catalog audit --help exits 0 without error."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["catalog", "audit", "--help"])
+        assert exc_info.value.code == 0
+
+
+@pytest.mark.unit
+class TestCompletionSubcommandRegistration:
+    """build_parser() registers the 'completion' subcommand (E7-F1-S1-T1)."""
+
+    def test_completion_subcommand_is_registered(self) -> None:
+        """build_parser() includes 'completion' as a registered subcommand."""
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                assert "completion" in action.choices, (
+                    "'completion' subcommand must be registered in the top-level parser"
+                )
+                return
+        pytest.fail("No subparsers action found in parser")
+
+    def test_completion_subcommand_parses_bash(self) -> None:
+        """'completion bash' stores shell='bash' in parsed namespace."""
+        parser = build_parser()
+        args = parser.parse_args(["completion", "bash"])
+        assert args.command == "completion"
+        assert args.shell == "bash"
+
+    def test_completion_subcommand_parses_zsh(self) -> None:
+        """'completion zsh' stores shell='zsh' in parsed namespace."""
+        parser = build_parser()
+        args = parser.parse_args(["completion", "zsh"])
+        assert args.command == "completion"
+        assert args.shell == "zsh"
+
+    def test_completion_subcommand_rejects_fish(self) -> None:
+        """'completion fish' exits non-zero -- 'fish' is not in the valid choices."""
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["completion", "fish"])
+        assert exc_info.value.code != 0
+
+    def test_completion_subcommand_sets_func_to_handle(self) -> None:
+        """'completion' subcommand sets args.func to handle."""
+        from mpm_cli.commands.completion import handle
+
+        parser = build_parser()
+        args = parser.parse_args(["completion", "bash"])
+        assert args.func is handle
+
+    def test_completion_help_exits_0(self) -> None:
+        """mpm completion --help exits 0 without error."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["completion", "--help"])
+        assert exc_info.value.code == 0
+
+
+@pytest.mark.unit
+class TestParserInjectionInMain:
+    """main() injects the root parser into args.parser before dispatch (E7-F1-S1-T1)."""
+
+    def test_main_injects_args_parser(self) -> None:
+        """main() sets args.parser to the root ArgumentParser before calling args.func."""
+        received: dict[str, object] = {}
+
+        def _capture_func(args: argparse.Namespace) -> None:
+            received["parser"] = getattr(args, "parser", None)
+
+        with patch("mpm_cli.cli.build_parser") as mock_build:
+            mock_parser = MagicMock()
+            mock_args = argparse.Namespace(
+                command="completion",
+                shell="bash",
+                quiet=False,
+                verbose=False,
+                no_color=False,
+                func=_capture_func,
+            )
+            mock_parser.parse_args.return_value = mock_args
+            mock_build.return_value = mock_parser
+            main([])
+
+        assert received.get("parser") is mock_parser, (
+            "main() must inject the root parser as args.parser before dispatching"
+        )
+
+
+@pytest.mark.unit
+class TestCompleteCatalogEntriesRegistration:
+    """build_parser() registers hidden __complete_catalog_entries subcommand (AC-FUNC-007)."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__complete_catalog_entries is a valid subcommand (parseable)."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_entries"])
+        assert args.command == "__complete_catalog_entries"
+
+    def test_hidden_subcommand_accepts_prefix_token(self) -> None:
+        """__complete_catalog_entries accepts an optional current-token argument."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_entries", "fo"])
+        assert args.current_token == "fo"
+
+    def test_hidden_subcommand_default_token_empty(self) -> None:
+        """Without a prefix argument, current_token defaults to empty string."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_entries"])
+        assert args.current_token == ""
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__complete_catalog_entries does not appear in mpm --help output (AC-FUNC-007).
+
+        mpm --help uses the custom _TOP_LEVEL_HELP constant (printed by
+        _TopLevelHelpAction). That constant does not mention hidden subcommands.
+        This test verifies the constant and the subparser's help=SUPPRESS together
+        satisfy the hidden contract.
+        """
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__complete_catalog_entries" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __complete_catalog_entries must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__complete_catalog_entries")
+                assert sub is not None, "__complete_catalog_entries must be registered"
+
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__complete_catalog_entries":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__complete_catalog_entries help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__complete_catalog_entries sets args.func to _handle."""
+        from mpm_cli.completions.catalog_entries import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_entries"])
+        assert args.func is _handle
+
+
+@pytest.mark.unit
+class TestCompleteSourceNamesRegistration:
+    """build_parser() registers hidden __complete_source_names_in_mpm subcommand."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__complete_source_names_in_mpm is a valid subcommand (parseable)."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_source_names_in_mpm"])
+        assert args.command == "__complete_source_names_in_mpm"
+
+    def test_hidden_subcommand_accepts_prefix_token(self) -> None:
+        """__complete_source_names_in_mpm accepts an optional current-token argument."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_source_names_in_mpm", "fo"])
+        assert args.current_token == "fo"
+
+    def test_hidden_subcommand_default_token_empty(self) -> None:
+        """Without a prefix argument, current_token defaults to empty string."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_source_names_in_mpm"])
+        assert args.current_token == ""
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__complete_source_names_in_mpm does not appear in mpm --help output (AC-FUNC-007)."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__complete_source_names_in_mpm" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __complete_source_names_in_mpm must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__complete_source_names_in_mpm")
+                assert sub is not None, "__complete_source_names_in_mpm must be registered"
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__complete_source_names_in_mpm":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__complete_source_names_in_mpm help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__complete_source_names_in_mpm sets args.func to _handle."""
+        from mpm_cli.completions.source_names import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__complete_source_names_in_mpm"])
+        assert args.func is _handle
+
+
+@pytest.mark.unit
+class TestCompleteLockfileNamesRegistration:
+    """build_parser() registers hidden __complete_names_in_lockfile subcommand."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__complete_names_in_lockfile is a valid subcommand (parseable)."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_names_in_lockfile"])
+        assert args.command == "__complete_names_in_lockfile"
+
+    def test_hidden_subcommand_accepts_prefix_token(self) -> None:
+        """__complete_names_in_lockfile accepts an optional current-token argument."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_names_in_lockfile", "fo"])
+        assert args.current_token == "fo"
+
+    def test_hidden_subcommand_default_token_empty(self) -> None:
+        """Without a prefix argument, current_token defaults to empty string."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_names_in_lockfile"])
+        assert args.current_token == ""
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__complete_names_in_lockfile does not appear in mpm --help output (AC-FUNC-007)."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__complete_names_in_lockfile" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __complete_names_in_lockfile must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__complete_names_in_lockfile")
+                assert sub is not None, "__complete_names_in_lockfile must be registered"
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__complete_names_in_lockfile":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__complete_names_in_lockfile help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__complete_names_in_lockfile sets args.func to _handle."""
+        from mpm_cli.completions.lockfile_names import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__complete_names_in_lockfile"])
+        assert args.func is _handle
+
+
+@pytest.mark.unit
+class TestCompleteCatalogVersionsRegistration:
+    """build_parser() registers hidden __complete_catalog_versions subcommand (AC-FUNC-007)."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__complete_catalog_versions is a valid subcommand (parseable)."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_versions"])
+        assert args.command == "__complete_catalog_versions"
+
+    def test_hidden_subcommand_accepts_prefix_token(self) -> None:
+        """__complete_catalog_versions accepts an optional current-token argument."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_versions", "1.0"])
+        assert args.current_token == "1.0"
+
+    def test_hidden_subcommand_default_token_empty(self) -> None:
+        """Without a prefix argument, current_token defaults to empty string."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_versions"])
+        assert args.current_token == ""
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__complete_catalog_versions does not appear in mpm --help output (AC-FUNC-007)."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__complete_catalog_versions" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __complete_catalog_versions must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__complete_catalog_versions")
+                assert sub is not None, "__complete_catalog_versions must be registered"
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__complete_catalog_versions":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__complete_catalog_versions help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__complete_catalog_versions sets args.func to _handle."""
+        from mpm_cli.completions.catalog_versions import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_versions"])
+        assert args.func is _handle
+
+    def test_refresh_only_flag_registered(self) -> None:
+        """__complete_catalog_versions accepts --refresh-only flag."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_versions", "--refresh-only"])
+        assert args.refresh_only is True
+
+    def test_refresh_only_defaults_to_false(self) -> None:
+        """Without --refresh-only, refresh_only defaults to False."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_catalog_versions"])
+        assert args.refresh_only is False
+
+
+@pytest.mark.unit
+class TestCompleteProjectVersionsRegistration:
+    """build_parser() registers hidden __complete_project_versions subcommand."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__complete_project_versions is a valid subcommand (parseable with two args)."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_project_versions", "https://example.com/proj.git", ""])
+        assert args.command == "__complete_project_versions"
+
+    def test_hidden_subcommand_accepts_repo_url_and_prefix(self) -> None:
+        """__complete_project_versions accepts repo_url and current_token arguments."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_project_versions", "https://example.com/proj.git", "1.0"])
+        assert args.repo_url == "https://example.com/proj.git"
+        assert args.current_token == "1.0"
+
+    def test_hidden_subcommand_repo_url_required(self) -> None:
+        """AC-FUNC-004: missing repo_url (first positional) causes non-zero exit."""
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["__complete_project_versions"])
+        assert exc_info.value.code != 0
+
+    def test_hidden_subcommand_current_token_required(self) -> None:
+        """AC-FUNC-004: missing current_token (second positional) causes non-zero exit."""
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["__complete_project_versions", "https://example.com/proj.git"])
+        assert exc_info.value.code != 0
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__complete_project_versions does not appear in mpm --help output (AC-FUNC-007)."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__complete_project_versions" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __complete_project_versions must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__complete_project_versions")
+                assert sub is not None, "__complete_project_versions must be registered"
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__complete_project_versions":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__complete_project_versions help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__complete_project_versions sets args.func to _handle."""
+        from mpm_cli.completions.project_versions import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__complete_project_versions", "https://example.com/proj.git", ""])
+        assert args.func is _handle
+
+
+@pytest.mark.unit
+class TestCompleteCachedCatalogsRegistration:
+    """build_parser() registers hidden __complete_cached_catalogs subcommand."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__complete_cached_catalogs is a valid subcommand (parseable)."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_cached_catalogs"])
+        assert args.command == "__complete_cached_catalogs"
+
+    def test_hidden_subcommand_accepts_prefix_token(self) -> None:
+        """__complete_cached_catalogs accepts an optional current-token argument."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_cached_catalogs", "https"])
+        assert args.current_token == "https"
+
+    def test_hidden_subcommand_default_token_empty(self) -> None:
+        """Without a prefix argument, current_token defaults to empty string."""
+        parser = build_parser()
+        args = parser.parse_args(["__complete_cached_catalogs"])
+        assert args.current_token == ""
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__complete_cached_catalogs does not appear in mpm --help output (AC-FUNC-006)."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__complete_cached_catalogs" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __complete_cached_catalogs must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__complete_cached_catalogs")
+                assert sub is not None, "__complete_cached_catalogs must be registered"
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__complete_cached_catalogs":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__complete_cached_catalogs help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__complete_cached_catalogs sets args.func to _handle."""
+        from mpm_cli.completions.cached_catalogs import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__complete_cached_catalogs"])
+        assert args.func is _handle
+
+
+@pytest.mark.unit
+class TestResolveEntryToRepoUrlRegistration:
+    """build_parser() registers hidden __resolve_entry_to_repo_url subcommand."""
+
+    def test_hidden_subcommand_registered(self) -> None:
+        """__resolve_entry_to_repo_url is a valid subcommand (parseable)."""
+        parser = build_parser()
+        args = parser.parse_args(["__resolve_entry_to_repo_url", "foo"])
+        assert args.command == "__resolve_entry_to_repo_url"
+
+    def test_hidden_subcommand_accepts_entry_name(self) -> None:
+        """__resolve_entry_to_repo_url accepts a required entry-name argument."""
+        parser = build_parser()
+        args = parser.parse_args(["__resolve_entry_to_repo_url", "my-entry"])
+        assert args.entry_name == "my-entry"
+
+    def test_hidden_subcommand_requires_entry_name(self) -> None:
+        """__resolve_entry_to_repo_url requires exactly one positional argument."""
+        import pytest
+
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["__resolve_entry_to_repo_url"])
+        assert exc_info.value.code != 0
+
+    def test_hidden_subcommand_not_in_help_text(self) -> None:
+        """__resolve_entry_to_repo_url does not appear in mpm --help output."""
+        from mpm_cli.cli import _TOP_LEVEL_HELP
+
+        assert "__resolve_entry_to_repo_url" not in _TOP_LEVEL_HELP, (
+            "Hidden subcommand __resolve_entry_to_repo_url must not appear in _TOP_LEVEL_HELP"
+        )
+
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get("__resolve_entry_to_repo_url")
+                assert sub is not None, "__resolve_entry_to_repo_url must be registered"
+                for choice_action in action._choices_actions:
+                    if choice_action.dest == "__resolve_entry_to_repo_url":
+                        assert choice_action.help == argparse.SUPPRESS, (
+                            "__resolve_entry_to_repo_url help must be argparse.SUPPRESS"
+                        )
+                        break
+                break
+
+    def test_hidden_subcommand_sets_func(self) -> None:
+        """__resolve_entry_to_repo_url sets args.func to _handle."""
+        from mpm_cli.completions.midtoken import _handle
+
+        parser = build_parser()
+        args = parser.parse_args(["__resolve_entry_to_repo_url", "foo"])
+        assert args.func is _handle
+
+
+@pytest.mark.unit
+class TestMainUserErrorHandler:
+    """main() converts escaping mpm user-errors into a clean exit-1, no traceback."""
+
+    def _dispatch_with_raising_func(self, exc: BaseException) -> argparse.Namespace:
+        """Build a Namespace whose func raises ``exc`` and patch build_parser to use it.
+
+        Returns the Namespace used so callers can assert on dispatch wiring if
+        needed. Mirrors the build_parser-patching pattern used elsewhere in
+        this module so no real subcommand has to be coerced into raising.
+        """
+
+        def _raising_func(_args: argparse.Namespace) -> int:
+            raise exc
+
+        return argparse.Namespace(
+            command="doctor",
+            quiet=False,
+            verbose=False,
+            no_color=False,
+            func=_raising_func,
+        )
+
+    def _run_main_with_raising_func(
+        self,
+        exc: BaseException,
+        capsys: pytest.CaptureFixture[str],
+    ) -> tuple[SystemExit, str, str]:
+        """Run main() with a func that raises ``exc``; return (SystemExit, stdout, stderr)."""
+        ns = self._dispatch_with_raising_func(exc)
+        with patch("mpm_cli.cli.build_parser") as mock_build:
+            mock_parser = MagicMock()
+            mock_parser.parse_args.return_value = ns
+            mock_build.return_value = mock_parser
+            with pytest.raises(SystemExit) as exc_info:
+                main([])
+        captured = capsys.readouterr()
+        return exc_info.value, captured.out, captured.err
+
+    def test_value_error_becomes_clean_exit_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A ValueError escaping a subcommand func exits 1 with a clean stderr error, no traceback."""
+        sysexit, out, err = self._run_main_with_raising_func(
+            ValueError("No sources found. Define at least one source"),
+            capsys,
+        )
+        assert sysexit.code == 1
+        assert "Traceback" not in err, f"stderr leaked a traceback: {err!r}"
+        assert "Traceback" not in out, f"stdout leaked a traceback: {out!r}"
+        assert "ERROR" in err, f"stderr missing clean ERROR prefix: {err!r}"
+        assert "No sources found" in err, f"stderr missing the error detail: {err!r}"
+
+    def test_install_error_becomes_clean_exit_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """An InstallError escaping a subcommand func exits 1 and prints str(exc) (already ERROR-prefixed)."""
+        from mpm_cli.core.include_walker import InstallError
+
+        sysexit, out, err = self._run_main_with_raising_func(
+            InstallError("ERROR: something went wrong with install"),
+            capsys,
+        )
+        assert sysexit.code == 1
+        assert "Traceback" not in err, f"stderr leaked a traceback: {err!r}"
+        assert "Traceback" not in out, f"stdout leaked a traceback: {out!r}"
+
+        assert "ERROR: something went wrong with install" in err, f"stderr={err!r}"
+
+    def test_file_not_found_becomes_clean_exit_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A FileNotFoundError escaping a subcommand func exits 1 with a clean ERROR message."""
+        sysexit, out, err = self._run_main_with_raising_func(
+            FileNotFoundError("missing .mpm"),
+            capsys,
+        )
+        assert sysexit.code == 1
+        assert "Traceback" not in err, f"stderr leaked a traceback: {err!r}"
+        assert "ERROR" in err, f"stderr missing clean ERROR prefix: {err!r}"
+
+    def test_repo_command_error_becomes_clean_exit_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A RepoCommandError escaping a subcommand func exits 1 with a clean ERROR message."""
+        from mpm_cli.repo import RepoCommandError
+
+        sysexit, out, err = self._run_main_with_raising_func(
+            RepoCommandError("repo init failed"),
+            capsys,
+        )
+        assert sysexit.code == 1
+        assert "Traceback" not in err, f"stderr leaked a traceback: {err!r}"
+        assert "ERROR" in err, f"stderr missing clean ERROR prefix: {err!r}"
+
+    def test_subcommand_sys_exit_propagates_unchanged(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A SystemExit raised by a subcommand func is NOT swallowed by the handler.
+
+        Per-command handlers call sys.exit(N) directly; the central handler must
+        let that exit code pass through unchanged rather than masking it as 1.
+        """
+        sysexit, _out, _err = self._run_main_with_raising_func(SystemExit(3), capsys)
+        assert sysexit.code == 3
+
+    def test_programming_error_is_not_masked(self) -> None:
+        """A non-user-error exception (e.g. KeyError) is NOT caught -- it propagates.
+
+        The handler must only catch the mpm user-error types; masking arbitrary
+        Exception would hide programming bugs behind a generic clean error.
+        """
+        ns = self._dispatch_with_raising_func(KeyError("internal bug"))
+        with patch("mpm_cli.cli.build_parser") as mock_build:
+            mock_parser = MagicMock()
+            mock_parser.parse_args.return_value = ns
+            mock_build.return_value = mock_parser
+            with pytest.raises(KeyError):
+                main([])

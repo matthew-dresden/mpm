@@ -1,0 +1,418 @@
+name: Main Branch Validation
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
+
+jobs:
+  pre-commit:
+    name: Pre-commit hooks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run pre-commit checks
+        shell: bash
+        run: |
+          source $HOME/.asdf/asdf.sh
+          make pre-commit-check
+
+  lint-check:
+    name: Lint (ruff check)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run ruff check
+        shell: bash
+        run: make lint-check
+
+  format-check:
+    name: Format check (ruff format --check)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run ruff format --check
+        shell: bash
+        run: make format-check
+
+  security-scan:
+    name: Security scan (bandit)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run bandit
+        shell: bash
+        run: make security-scan
+
+  build:
+    name: Build wheel
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Build distribution
+        shell: bash
+        run: make publish
+
+  # ---------------------------------------------------------------------------
+  # Test tiers run on a single LINUX set (ubuntu-24.04). Each tier runs exactly
+  # once with the bare tier marker (for example -m "unit", -m "integration");
+  # no per-OS marker filter is threaded. Each leg is an independent job. Every
+  # run step uses `shell: bash` and fails the job on a non-zero exit, so there
+  # is no fallback or silent skip.
+  # ---------------------------------------------------------------------------
+
+  unit-tests-linux:
+    name: Unit tests (Linux, with coverage gate)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run unit tests with 90% coverage gate
+        shell: bash
+        run: |
+          python -m pytest -n auto --dist loadscope -m "unit" --cov=mpm_cli --cov-report=term-missing
+          coverage json
+          coverage_percent=$(python -c "import json; f=open('coverage.json'); print(json.load(f)['totals']['percent_covered'])")
+          echo "Coverage: $coverage_percent%"
+          if (( $(echo "$coverage_percent < 90" | bc -l) )); then
+            echo "Error: Code coverage is below 90% threshold ($coverage_percent%)"
+            exit 1
+          fi
+
+  integration-tests-linux:
+    name: Integration tests (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run integration tests
+        shell: bash
+        run: python -m pytest -n auto --dist loadscope -m "integration"
+
+  functional-tests-linux:
+    name: Functional tests (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run functional tests
+        shell: bash
+        run: SMOKE_TEST_TIMEOUT=300 python -m pytest -n auto --dist loadscope -m "functional"
+
+  scenario-tests-linux:
+    name: Scenario tests (Linux, docs/integration-testing.md)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run scenario tests
+        shell: bash
+        # Invokes the make target (operator-path guard E50-F1-S1-T2 requires it).
+        # The recipe runs `pytest -m "scenario"` with no platform filter.
+        run: make test-scenarios
+
+  full-suite-regression:
+    name: Full suite regression (cross-suite isolation guard)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-mpm
+      - name: Run the full suite together
+        shell: bash
+        run: make test
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:python"
+
+  manual-approval:
+    name: Manual QA Approval
+    needs:
+      - pre-commit
+      - lint-check
+      - format-check
+      - security-scan
+      - build
+      - unit-tests-linux
+      - integration-tests-linux
+      - functional-tests-linux
+      - scenario-tests-linux
+      - full-suite-regression
+      - codeql
+    runs-on: ubuntu-24.04
+    environment:
+      name: qa-approval
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: QA Approval
+        shell: bash
+        run: echo "QA has been approved"
+
+  create-release:
+    name: Create Release
+    needs: [manual-approval]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate token from GitHub App
+        id: generate_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.GH_APP_ID }}
+          private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Cache ASDF installation for release
+        uses: actions/cache@v5
+        with:
+          path: ~/.asdf
+          key: ${{ runner.os }}-asdf-release-v0.15.0-${{ hashFiles('.tool-versions') }}
+          restore-keys: |
+            ${{ runner.os }}-asdf-release-v0.15.0-
+            ${{ runner.os }}-asdf-v0.15.0-
+
+      - name: Install ASDF
+        shell: bash
+        run: |
+          if [ ! -d ~/.asdf ]; then
+            git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.15.0
+          fi
+          echo "$HOME/.asdf/bin" >> $GITHUB_PATH
+          echo "$HOME/.asdf/shims" >> $GITHUB_PATH
+          source $HOME/.asdf/asdf.sh
+
+      - name: Install ASDF plugins and tools
+        shell: bash
+        run: |
+          cd $GITHUB_WORKSPACE
+          source $HOME/.asdf/asdf.sh
+          cut -d' ' -f1 .tool-versions | xargs -I{} asdf plugin add {} || true
+          asdf plugin remove python 2>/dev/null || true
+          asdf install
+          asdf reshim
+
+      - name: Cache Python dependencies for release
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.local/lib/python*/site-packages
+          key: ${{ runner.os }}-pip-release-${{ hashFiles('requirements-dev.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-release-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          make install-dev
+
+      - name: Compute next version
+        id: semantic-release
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        shell: bash
+        run: |
+          NEW_VERSION=$(python -m semantic_release version --print | sed 's/^v//')
+          echo "New version: $NEW_VERSION"
+          if [[ -z "$NEW_VERSION" ]]; then
+            echo "No new version detected, using current version"
+            NEW_VERSION=$(python -c "import importlib.metadata; print(importlib.metadata.version('missing-package-manager'))")
+            echo "Current version: $NEW_VERSION"
+          fi
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog and update version files
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        shell: bash
+        run: |
+          python -m semantic_release version --no-push --no-vcs-release --no-commit
+
+          NEW_VERSION=$(grep '^version = ' pyproject.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          echo "Updated version: $NEW_VERSION"
+
+          sed -i "s/__version__ = \"[^\"]*\"/__version__ = \"$NEW_VERSION\"/" src/mpm_cli/__init__.py
+          echo "Updated __init__.py to version: $NEW_VERSION"
+
+          sed -i 's/[[:space:]]*$//' CHANGELOG.md pyproject.toml src/mpm_cli/__init__.py
+
+          rm -rf dist/ build/ src/mpm_cli.egg-info/
+
+      - name: Commit changelog and version bump
+        id: commit-changes
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' pyproject.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          echo "VERSION: $VERSION"
+
+          if [[ -z "$VERSION" ]]; then
+            echo "ERROR: version is empty. Exiting."
+            exit 1
+          fi
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}
+
+          echo "Git status before staging:"
+          git status --porcelain
+
+          git add CHANGELOG.md pyproject.toml src/mpm_cli/__init__.py
+
+          echo "Git status after staging:"
+          STAGED=$(git status --porcelain)
+          echo "$STAGED"
+
+          if [[ -z "$STAGED" ]]; then
+            echo "No file changes detected -- no version bump needed. Skipping release."
+            echo "skip_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore(release): $VERSION"
+
+          git checkout -b release-$VERSION
+          git push origin release-$VERSION
+
+          PR_URL=$(gh pr create \
+            --title "Release $VERSION" \
+            --body "Automated release PR for version $VERSION" \
+            --base main \
+            --head release-$VERSION)
+          echo "Pull request created: $PR_URL"
+
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "skip_release=false" >> "$GITHUB_OUTPUT"
+
+          gh pr merge ${PR_URL} --admin --merge
+          echo "Pull request merged successfully"
+
+      - name: Wait for PR to merge and create Git tag
+        if: steps.commit-changes.outputs.skip_release != 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PR_URL="${{ steps.commit-changes.outputs.pr_url }}"
+          PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]\+$')
+          NEW_VERSION=$(grep '^version = ' pyproject.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+
+          echo "Waiting for PR #$PR_NUMBER to be merged..."
+
+          MAX_ATTEMPTS=10
+          ATTEMPT=1
+          DELAY=3
+
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            MERGED_AT=$(gh pr view "$PR_NUMBER" --json mergedAt -q '.mergedAt' || echo "")
+            if [[ -n "$MERGED_AT" && "$MERGED_AT" != "null" ]]; then
+              echo "PR #$PR_NUMBER merged at $MERGED_AT"
+              break
+            fi
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: PR not merged yet, retrying in $DELAY seconds..."
+            sleep "$DELAY"
+            ATTEMPT=$((ATTEMPT + 1))
+            DELAY=$((DELAY * 2))
+          done
+
+          if [ "$ATTEMPT" -gt "$MAX_ATTEMPTS" ]; then
+            echo "Timed out waiting for PR to merge, continuing anyway."
+          fi
+
+          git fetch --all
+          git checkout main
+          git pull origin main
+          git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
+          git push origin "$NEW_VERSION"
+
+          echo "Cleaning up release branch: release-$NEW_VERSION"
+          git push origin --delete release-$NEW_VERSION || echo "Branch already deleted or doesn't exist"
+
+      - name: Trigger publish workflow
+        if: steps.commit-changes.outputs.skip_release != 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        shell: bash
+        run: |
+          NEW_VERSION=$(grep '^version = ' pyproject.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          gh workflow run publish.yml -f tag="$NEW_VERSION"

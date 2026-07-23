@@ -1,0 +1,924 @@
+"""Integration tests for the mpm install step-by-step lifecycle.
+
+Covers the install lifecycle in sequential order:
+  init -> envsubst -> sync -> aggregate
+
+AC-TEST-001: install creates .packages/ and .mpm-data/ directories
+AC-TEST-002: a non-git store gets no .gitignore from install
+AC-TEST-003: install performs repo init + envsubst + sync in the correct order
+AC-TEST-004: install aggregates multiple sources without collision (MS-01 class)
+AC-FUNC-001: Lifecycle order is init -> envsubst -> sync -> aggregate
+AC-CHANNEL-001: stdout vs stderr discipline (no cross-channel leakage)
+"""
+
+import os
+import pathlib
+from unittest.mock import patch
+
+import pytest
+
+from mpm_cli.commands.install import _run as _install_run
+from mpm_cli.core.install import install
+from tests.conftest import write_manifest_for_sync
+
+
+def _store_base() -> pathlib.Path:
+    """Return the shared artifact store base (``<MPM_HOME>/store``).
+
+    install()/clean() create and remove ``.packages/`` and ``.mpm-data/``
+    under the shared store, not beside the project ``.mpm``. A store
+    ``.gitignore`` safety net is written only when the store is inside a git
+    working tree; the isolated per-test store is not a git repo, so install()
+    writes no ``.gitignore`` here. The ``_isolate_mpm_home`` autouse fixture
+    points MPM_HOME at a fresh per-test temporary directory, so this resolves
+    to a writable, isolated path.
+    """
+    return pathlib.Path(os.environ["MPM_HOME"]) / "store"
+
+
+def _write_single_source_mpmenv(directory: pathlib.Path, source_name: str = "primary") -> pathlib.Path:
+    """Write a minimal single-source .mpm file and return its path.
+
+    Args:
+        directory: Directory in which to create the .mpm file.
+        source_name: Source name to use in MPM_SOURCE_* keys.
+
+    Returns:
+        Absolute path to the written .mpm file.
+    """
+    mpmenv = directory / ".mpm"
+    mpmenv.write_text(
+        f"MPM_MARKETPLACE_INSTALL=false\n"
+        f"MPM_SOURCE_{source_name}_URL=https://example.com/{source_name}.git\n"
+        f"MPM_SOURCE_{source_name}_REF=main\n"
+        f"MPM_SOURCE_{source_name}_PATH=repo-specs/manifest.xml\n"
+        f"MPM_SOURCE_{source_name}_NAME={source_name}\n"
+        f"MPM_SOURCE_{source_name}_GITBASE=https://example.com\n"
+    )
+    return mpmenv.resolve()
+
+
+def _write_two_source_mpmenv(
+    directory: pathlib.Path,
+    source_alpha: str = "alpha",
+    source_bravo: str = "bravo",
+) -> pathlib.Path:
+    """Write a minimal two-source .mpm file and return its path.
+
+    Args:
+        directory: Directory in which to create the .mpm file.
+        source_alpha: Name for the first source (alphabetically first).
+        source_bravo: Name for the second source (alphabetically second).
+
+    Returns:
+        Absolute path to the written .mpm file.
+    """
+    mpmenv = directory / ".mpm"
+    mpmenv.write_text(
+        f"MPM_MARKETPLACE_INSTALL=false\n"
+        f"MPM_SOURCE_{source_alpha}_URL=https://example.com/{source_alpha}.git\n"
+        f"MPM_SOURCE_{source_alpha}_REF=main\n"
+        f"MPM_SOURCE_{source_alpha}_PATH=repo-specs/manifest.xml\n"
+        f"MPM_SOURCE_{source_alpha}_NAME={source_alpha}\n"
+        f"MPM_SOURCE_{source_alpha}_GITBASE=https://example.com\n"
+        f"MPM_SOURCE_{source_bravo}_URL=https://example.com/{source_bravo}.git\n"
+        f"MPM_SOURCE_{source_bravo}_REF=main\n"
+        f"MPM_SOURCE_{source_bravo}_PATH=repo-specs/manifest.xml\n"
+        f"MPM_SOURCE_{source_bravo}_NAME={source_bravo}\n"
+        f"MPM_SOURCE_{source_bravo}_GITBASE=https://example.com\n"
+    )
+    return mpmenv.resolve()
+
+
+def _install_with_patched_repo(mpmenv: pathlib.Path) -> None:
+    """Run install() with all repo operations patched to no-ops.
+
+    The repo_init mock creates the minimal manifest XML under
+    source_dir/.repo/manifests/<manifest_path> so that install()'s
+    include-walker can parse the manifest after sync.
+
+    Args:
+        mpmenv: Path to the .mpm configuration file.
+    """
+
+    def fake_repo_init(repo_dir: str, url: str, revision: str, manifest_path: str, repo_rev: str = "") -> None:
+        write_manifest_for_sync(pathlib.Path(repo_dir), sub_path=manifest_path)
+
+    with (
+        patch("mpm_cli.repo.repo_init", side_effect=fake_repo_init),
+        patch("mpm_cli.repo.repo_envsubst"),
+        patch("mpm_cli.repo.repo_sync"),
+    ):
+        install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+
+def _install_with_synced_packages(
+    mpmenv: pathlib.Path,
+    packages_by_source: dict[str, list[str]],
+) -> None:
+    """Run install() with fake repo_sync that creates .packages/ entries.
+
+    Args:
+        mpmenv: Path to the .mpm configuration file.
+        packages_by_source: Mapping of source name to list of package names.
+    """
+
+    def fake_repo_init(repo_dir: str, url: str, revision: str, manifest_path: str, repo_rev: str = "") -> None:
+        write_manifest_for_sync(pathlib.Path(repo_dir), sub_path=manifest_path)
+
+    def fake_repo_sync(repo_dir: str, **kwargs: object) -> None:
+        repo_path = pathlib.Path(repo_dir)
+        source_name = repo_path.name
+        for pkg_name in packages_by_source.get(source_name, []):
+            pkg_dir = repo_path / ".packages" / pkg_name
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            (pkg_dir / "README.md").write_text(f"# {pkg_name}\n")
+
+    with (
+        patch("mpm_cli.repo.repo_init", side_effect=fake_repo_init),
+        patch("mpm_cli.repo.repo_envsubst"),
+        patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync),
+    ):
+        install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+
+@pytest.mark.integration
+class TestInstallCreatesDirectories:
+    """AC-TEST-001: install creates .packages/ and .mpm-data/ directories.
+
+    Verifies that after install() completes, the managed directory tree is
+    fully created: .packages/ under the shared store and
+    .mpm-data/sources/<name>/ for every declared source.
+    """
+
+    def test_packages_dir_created_after_install(self, tmp_path: pathlib.Path) -> None:
+        """install creates .packages/ under the shared store.
+
+        .packages/ must exist and be a directory after a successful install.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        packages_dir = _store_base() / ".packages"
+        assert packages_dir.is_dir(), f".packages/ must be created by install at {packages_dir}; it does not exist"
+
+    def test_mpm_data_dir_created_after_install(self, tmp_path: pathlib.Path) -> None:
+        """.mpm-data/ directory is created as part of the install lifecycle.
+
+        The managed data directory .mpm-data/ must exist after install.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        mpm_data_dir = _store_base() / ".mpm-data"
+        assert mpm_data_dir.is_dir(), f".mpm-data/ must be created by install at {mpm_data_dir}; it does not exist"
+
+    def test_source_workspace_dir_created_under_mpm_data(self, tmp_path: pathlib.Path) -> None:
+        """install creates .mpm-data/sources/<name>/ for each declared source.
+
+        A single source 'primary' means .mpm-data/sources/primary/ must exist.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path, "primary")
+        _install_with_patched_repo(mpmenv)
+
+        source_dir = _store_base() / ".mpm-data" / "sources" / "primary"
+        assert source_dir.is_dir(), (
+            f".mpm-data/sources/primary/ must be created by install; it does not exist at {source_dir}"
+        )
+
+    def test_both_packages_and_mpm_data_created_together(self, tmp_path: pathlib.Path) -> None:
+        """.packages/ and .mpm-data/ are both created in a single install() call.
+
+        Neither directory may be absent after a completed install.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        store_base = _store_base()
+        assert (store_base / ".packages").is_dir(), ".packages/ must exist after install"
+        assert (store_base / ".mpm-data").is_dir(), ".mpm-data/ must exist after install"
+
+    @pytest.mark.parametrize("source_name", ["alpha", "bravo", "primary", "myrepo"])
+    def test_source_workspace_named_correctly_for_source(
+        self,
+        tmp_path: pathlib.Path,
+        source_name: str,
+    ) -> None:
+        """The source workspace directory name matches the source name in .mpm.
+
+        For each parameterized source name, .mpm-data/sources/<source_name>/
+        must be the workspace directory created for that source.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path, source_name)
+        _install_with_patched_repo(mpmenv)
+
+        source_dir = _store_base() / ".mpm-data" / "sources" / source_name
+        assert source_dir.is_dir(), f".mpm-data/sources/{source_name}/ must exist for source '{source_name}'"
+
+    def test_two_sources_create_separate_mpm_data_dirs(self, tmp_path: pathlib.Path) -> None:
+        """Two sources each get their own .mpm-data/sources/<name>/ directory.
+
+        The directories must be distinct and both must exist after install.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+        _install_with_patched_repo(mpmenv)
+
+        store_base = _store_base()
+        alpha_dir = store_base / ".mpm-data" / "sources" / "alpha"
+        bravo_dir = store_base / ".mpm-data" / "sources" / "bravo"
+
+        assert alpha_dir.is_dir(), ".mpm-data/sources/alpha/ must exist"
+        assert bravo_dir.is_dir(), ".mpm-data/sources/bravo/ must exist"
+        assert alpha_dir != bravo_dir, "Source workspace directories must be distinct"
+
+
+@pytest.mark.integration
+class TestInstallGitignoreIdempotency:
+    """AC-TEST-002: a non-git store gets no .gitignore from install.
+
+    The store safety-net .gitignore is written only when the store is inside a
+    git working tree. The isolated per-test store (MPM_HOME) is NOT a git
+    repo, so install() must never create a .gitignore there. These tests guard
+    that no-git-store behavior across single and repeated install() runs and
+    across pre-existing .gitignore content.
+    """
+
+    _REQUIRED_ENTRIES = [".packages/", ".mpm-data/"]
+
+    def test_install_creates_gitignore_when_absent(self, tmp_path: pathlib.Path) -> None:
+        """install writes no .gitignore into a non-git store.
+
+        The store starts without a .gitignore and must still have none after
+        install(), because the store is not inside a git working tree.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        assert not (_store_base() / ".gitignore").exists(), "Precondition: .gitignore must not exist"
+
+        _install_with_patched_repo(mpmenv)
+
+        assert not (_store_base() / ".gitignore").exists(), (
+            "install must not create a .gitignore in a store that is not inside a git repo"
+        )
+
+    @pytest.mark.parametrize("entry", _REQUIRED_ENTRIES)
+    def test_install_writes_required_gitignore_entry(
+        self,
+        tmp_path: pathlib.Path,
+        entry: str,
+    ) -> None:
+        """No .gitignore is written for a non-git store, so no entry is added.
+
+        Because the store is not inside a git working tree, install() writes no
+        .gitignore at all; there is therefore nothing containing the previously
+        managed entries.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        assert not (_store_base() / ".gitignore").exists(), (
+            f"install must not create a .gitignore (and thus not add {entry!r}) for a non-git store"
+        )
+
+    @pytest.mark.parametrize("entry", _REQUIRED_ENTRIES)
+    def test_install_does_not_duplicate_gitignore_entry_on_second_run(
+        self,
+        tmp_path: pathlib.Path,
+        entry: str,
+    ) -> None:
+        """Repeated installs never create a .gitignore in a non-git store.
+
+        Two install() runs against a non-git store must still leave no
+        .gitignore behind, so no entry can be duplicated.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        _install_with_patched_repo(mpmenv)
+        _install_with_patched_repo(mpmenv)
+
+        assert not (_store_base() / ".gitignore").exists(), (
+            f"two installs against a non-git store must not create a .gitignore (and thus not duplicate {entry!r})"
+        )
+
+    def test_install_preserves_preexisting_gitignore_content(self, tmp_path: pathlib.Path) -> None:
+        """install does not remove preexisting .gitignore entries.
+
+        When a .gitignore with user content exists before install, the user
+        content must be preserved after install adds the mpm entries.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        store_base = _store_base()
+        store_base.mkdir(parents=True, exist_ok=True)
+        gitignore = store_base / ".gitignore"
+        gitignore.write_text("*.pyc\nbuild/\ndist/\n")
+
+        _install_with_patched_repo(mpmenv)
+
+        content = gitignore.read_text()
+        assert "*.pyc" in content, "Preexisting '*.pyc' entry must be preserved"
+        assert "build/" in content, "Preexisting 'build/' entry must be preserved"
+        assert "dist/" in content, "Preexisting 'dist/' entry must be preserved"
+
+    def test_install_does_not_add_entry_when_already_present(self, tmp_path: pathlib.Path) -> None:
+        """install does not write entries that already exist in .gitignore.
+
+        When both mpm entries are pre-populated, the file content must
+        be identical before and after install runs.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        store_base = _store_base()
+        store_base.mkdir(parents=True, exist_ok=True)
+        gitignore = store_base / ".gitignore"
+        gitignore.write_text(".packages/\n.mpm-data/\n")
+        original_content = gitignore.read_text()
+
+        _install_with_patched_repo(mpmenv)
+
+        content = gitignore.read_text()
+        assert content == original_content, (
+            f".gitignore content must be unchanged when entries are pre-existing; "
+            f"before={original_content!r}, after={content!r}"
+        )
+
+    def test_install_entries_each_on_own_line(self, tmp_path: pathlib.Path) -> None:
+        """No .gitignore is written for a non-git store, so no entry lines exist.
+
+        Because the store is not inside a git working tree, install() writes no
+        .gitignore, so none of the previously managed entries appear on any line.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        assert not (_store_base() / ".gitignore").exists(), (
+            "install must not create a .gitignore for a non-git store, so no managed entry lines are written"
+        )
+
+
+@pytest.mark.integration
+class TestInstallRepoOperationOrder:
+    """AC-TEST-003: install performs repo init + envsubst + sync in the correct order.
+
+    For each source the install lifecycle must run repo init, then repo envsubst,
+    then repo sync -- in that exact sequence. No other ordering is acceptable.
+    """
+
+    def test_repo_init_called_before_envsubst(self, tmp_path: pathlib.Path) -> None:
+        """repo init is called before repo envsubst for each source.
+
+        The call order of the mocked functions is captured and verified to
+        confirm init precedes envsubst in the call sequence.
+        """
+        call_order: list[str] = []
+
+        def record_init(repo_dir: str, *args: object, **kwargs: object) -> None:
+            call_order.append("init")
+
+        def record_envsubst(repo_dir: str, *args: object, **kwargs: object) -> None:
+            call_order.append("envsubst")
+
+        def record_sync(repo_dir: str, **kwargs: object) -> None:
+            call_order.append("sync")
+
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init", side_effect=record_init),
+            patch("mpm_cli.repo.repo_envsubst", side_effect=record_envsubst),
+            patch("mpm_cli.repo.repo_sync", side_effect=record_sync),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert "init" in call_order, "repo_init must be called during install"
+        assert "envsubst" in call_order, "repo_envsubst must be called during install"
+        init_pos = call_order.index("init")
+        envsubst_pos = call_order.index("envsubst")
+        assert init_pos < envsubst_pos, f"repo_init must be called before repo_envsubst; call_order={call_order!r}"
+
+    def test_repo_envsubst_called_before_sync(self, tmp_path: pathlib.Path) -> None:
+        """repo envsubst is called before repo sync for each source.
+
+        The call order must show envsubst preceding sync in the sequence.
+        """
+        call_order: list[str] = []
+
+        def record_init(repo_dir: str, *args: object, **kwargs: object) -> None:
+            call_order.append("init")
+
+        def record_envsubst(repo_dir: str, *args: object, **kwargs: object) -> None:
+            call_order.append("envsubst")
+
+        def record_sync(repo_dir: str, **kwargs: object) -> None:
+            call_order.append("sync")
+
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init", side_effect=record_init),
+            patch("mpm_cli.repo.repo_envsubst", side_effect=record_envsubst),
+            patch("mpm_cli.repo.repo_sync", side_effect=record_sync),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        envsubst_pos = call_order.index("envsubst")
+        sync_pos = call_order.index("sync")
+        assert envsubst_pos < sync_pos, f"repo_envsubst must be called before repo_sync; call_order={call_order!r}"
+
+    def test_repo_init_envsubst_sync_full_order(self, tmp_path: pathlib.Path) -> None:
+        """The full per-source lifecycle order is init -> envsubst -> sync.
+
+        All three operations must appear in the call sequence in the specified
+        order for a single-source install.
+        """
+        call_order: list[str] = []
+
+        def record_init(repo_dir: str, *args: object, **kwargs: object) -> None:
+            call_order.append("init")
+
+        def record_envsubst(repo_dir: str, *args: object, **kwargs: object) -> None:
+            call_order.append("envsubst")
+
+        def record_sync(repo_dir: str, **kwargs: object) -> None:
+            call_order.append("sync")
+
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init", side_effect=record_init),
+            patch("mpm_cli.repo.repo_envsubst", side_effect=record_envsubst),
+            patch("mpm_cli.repo.repo_sync", side_effect=record_sync),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        expected_order = ["init", "envsubst", "sync"]
+        for step in expected_order:
+            assert step in call_order, f"'{step}' must appear in the call sequence"
+
+        init_pos = call_order.index("init")
+        envsubst_pos = call_order.index("envsubst")
+        sync_pos = call_order.index("sync")
+        assert init_pos < envsubst_pos < sync_pos, (
+            f"Lifecycle must be init -> envsubst -> sync; actual order: {call_order!r}"
+        )
+
+    def test_per_source_init_called_exactly_once(self, tmp_path: pathlib.Path) -> None:
+        """repo_init is called exactly once per declared source.
+
+        With a single source, repo_init must be called exactly once.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init") as mock_init,
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync"),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert mock_init.call_count == 1, (
+            f"repo_init must be called exactly once for a single source; was called {mock_init.call_count} times"
+        )
+
+    def test_per_source_envsubst_called_exactly_once(self, tmp_path: pathlib.Path) -> None:
+        """repo_envsubst is called exactly once per declared source.
+
+        With a single source, repo_envsubst must be called exactly once.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst") as mock_envsubst,
+            patch("mpm_cli.repo.repo_sync"),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert mock_envsubst.call_count == 1, (
+            f"repo_envsubst must be called exactly once for a single source; "
+            f"was called {mock_envsubst.call_count} times"
+        )
+
+    def test_per_source_sync_called_exactly_once(self, tmp_path: pathlib.Path) -> None:
+        """repo_sync is called exactly once per declared source.
+
+        With a single source, repo_sync must be called exactly once.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync") as mock_sync,
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert mock_sync.call_count == 1, (
+            f"repo_sync must be called exactly once for a single source; was called {mock_sync.call_count} times"
+        )
+
+    def test_two_sources_each_get_full_lifecycle(self, tmp_path: pathlib.Path) -> None:
+        """With two sources, init+envsubst+sync are called once per source (2 times each).
+
+        The lifecycle must be applied to every declared source, not just the first.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+
+        with (
+            patch("mpm_cli.repo.repo_init") as mock_init,
+            patch("mpm_cli.repo.repo_envsubst") as mock_envsubst,
+            patch("mpm_cli.repo.repo_sync") as mock_sync,
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert mock_init.call_count == 2, (
+            f"repo_init must be called once per source (2 sources); was called {mock_init.call_count} times"
+        )
+        assert mock_envsubst.call_count == 2, (
+            f"repo_envsubst must be called once per source (2 sources); was called {mock_envsubst.call_count} times"
+        )
+        assert mock_sync.call_count == 2, (
+            f"repo_sync must be called once per source (2 sources); was called {mock_sync.call_count} times"
+        )
+
+    def test_two_sources_per_source_order_respected(self, tmp_path: pathlib.Path) -> None:
+        """For each of two sources, the init -> envsubst -> sync order is maintained.
+
+        The call sequence must show init, envsubst, sync for the first source
+        (alpha) before any operation for the second source (bravo).
+        """
+        call_sequence: list[tuple[str, str]] = []
+
+        def record_init(repo_dir: str, *args: object, **kwargs: object) -> None:
+            source = pathlib.Path(repo_dir).name
+            call_sequence.append(("init", source))
+
+        def record_envsubst(repo_dir: str, *args: object, **kwargs: object) -> None:
+            source = pathlib.Path(repo_dir).name
+            call_sequence.append(("envsubst", source))
+
+        def record_sync(repo_dir: str, **kwargs: object) -> None:
+            source = pathlib.Path(repo_dir).name
+            call_sequence.append(("sync", source))
+
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+
+        with (
+            patch("mpm_cli.repo.repo_init", side_effect=record_init),
+            patch("mpm_cli.repo.repo_envsubst", side_effect=record_envsubst),
+            patch("mpm_cli.repo.repo_sync", side_effect=record_sync),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        alpha_ops = [op for op, src in call_sequence if src == "alpha"]
+        bravo_ops = [op for op, src in call_sequence if src == "bravo"]
+
+        assert alpha_ops == ["init", "envsubst", "sync"], (
+            f"Source 'alpha' must be processed in order init->envsubst->sync; got {alpha_ops!r}"
+        )
+        assert bravo_ops == ["init", "envsubst", "sync"], (
+            f"Source 'bravo' must be processed in order init->envsubst->sync; got {bravo_ops!r}"
+        )
+
+
+@pytest.mark.integration
+class TestInstallMultiSourceAggregation:
+    """AC-TEST-004: install aggregates multiple sources without collision (MS-01 class).
+
+    Two sources with distinct package names produce a merged .packages/ directory
+    with one symlink per package, each pointing into its source's workspace.
+    """
+
+    def test_ms01_both_packages_present_in_packages_dir(self, tmp_path: pathlib.Path) -> None:
+        """MS-01: packages from both sources appear in .packages/ after install.
+
+        Source 'alpha' delivers 'pkg-from-alpha'; source 'bravo' delivers
+        'pkg-from-bravo'. Both symlinks must exist in .packages/.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+        _install_with_synced_packages(
+            mpmenv,
+            {"alpha": ["pkg-from-alpha"], "bravo": ["pkg-from-bravo"]},
+        )
+
+        store_base = _store_base()
+        assert (store_base / ".packages" / "pkg-from-alpha").is_symlink(), (
+            "pkg-from-alpha from source 'alpha' must be symlinked in .packages/"
+        )
+        assert (store_base / ".packages" / "pkg-from-bravo").is_symlink(), (
+            "pkg-from-bravo from source 'bravo' must be symlinked in .packages/"
+        )
+
+    def test_ms01_symlinks_resolve_into_source_workspaces(self, tmp_path: pathlib.Path) -> None:
+        """MS-01: each symlink resolves into its source's .mpm-data workspace.
+
+        pkg-from-alpha must resolve into .mpm-data/sources/alpha/.packages/pkg-from-alpha
+        and pkg-from-bravo into .mpm-data/sources/bravo/.packages/pkg-from-bravo.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+        _install_with_synced_packages(
+            mpmenv,
+            {"alpha": ["pkg-from-alpha"], "bravo": ["pkg-from-bravo"]},
+        )
+
+        store_base = _store_base()
+        alpha_link = store_base / ".packages" / "pkg-from-alpha"
+        bravo_link = store_base / ".packages" / "pkg-from-bravo"
+
+        alpha_workspace = store_base / ".mpm-data" / "sources" / "alpha" / ".packages" / "pkg-from-alpha"
+        bravo_workspace = store_base / ".mpm-data" / "sources" / "bravo" / ".packages" / "pkg-from-bravo"
+
+        assert alpha_link.resolve() == alpha_workspace.resolve(), (
+            f"pkg-from-alpha symlink must resolve to alpha workspace; got {alpha_link.resolve()}"
+        )
+        assert bravo_link.resolve() == bravo_workspace.resolve(), (
+            f"pkg-from-bravo symlink must resolve to bravo workspace; got {bravo_link.resolve()}"
+        )
+
+    def test_ms01_no_collision_on_disjoint_packages(self, tmp_path: pathlib.Path) -> None:
+        """MS-01: install does not exit non-zero when sources provide disjoint packages.
+
+        With distinct package names across sources, install() must complete
+        without raising SystemExit.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+
+        try:
+            _install_with_synced_packages(
+                mpmenv,
+                {"alpha": ["tool-a"], "bravo": ["tool-b"]},
+            )
+        except SystemExit as exc:
+            raise AssertionError(
+                f"install() must not raise SystemExit for disjoint packages; got exit code {exc.code}"
+            ) from exc
+
+    @pytest.mark.parametrize(
+        "packages_by_source",
+        [
+            {"alpha": ["pkg-a1", "pkg-a2"], "bravo": ["pkg-b1", "pkg-b2"]},
+            {"alpha": ["only-alpha"], "bravo": ["only-bravo"]},
+            {"alpha": ["x", "y", "z"], "bravo": ["p", "q"]},
+        ],
+    )
+    def test_ms01_all_packages_aggregated_for_various_counts(
+        self,
+        tmp_path: pathlib.Path,
+        packages_by_source: dict[str, list[str]],
+    ) -> None:
+        """MS-01: all packages from both sources appear in .packages/ regardless of count.
+
+        Tests multiple package distributions across two sources to confirm
+        the aggregation loop handles variable package counts correctly.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+        _install_with_synced_packages(mpmenv, packages_by_source)
+
+        store_base = _store_base()
+        all_expected = [pkg for pkgs in packages_by_source.values() for pkg in pkgs]
+        for pkg_name in all_expected:
+            link = store_base / ".packages" / pkg_name
+            assert link.is_symlink(), f"Package '{pkg_name}' must be symlinked in .packages/ after install"
+
+    def test_ms01_collision_exits_nonzero_with_error(
+        self, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture, make_install_args
+    ) -> None:
+        """MS-01 collision path: the CLI handler exits non-zero with a collision error on stderr.
+
+        When 'alpha' and 'bravo' both provide 'shared-pkg', the CLI handler must
+        exit with a non-zero code and write a 'Package collision' error to stderr.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+
+        def fake_repo_sync_collision(repo_dir: str, **kwargs: object) -> None:
+            pkg_dir = pathlib.Path(repo_dir) / ".packages" / "shared-pkg"
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            (pkg_dir / "README.md").write_text("# shared\n")
+
+        args = make_install_args(mpmenv.resolve())
+        with pytest.raises(SystemExit) as exc_info:
+            with (
+                patch("mpm_cli.repo.repo_init"),
+                patch("mpm_cli.repo.repo_envsubst"),
+                patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync_collision),
+            ):
+                _install_run(args)
+
+        assert exc_info.value.code != 0, "CLI handler must exit non-zero on package collision"
+        captured = capsys.readouterr()
+        assert "Package collision" in captured.err, f"stderr must contain 'Package collision'; got: {captured.err!r}"
+        assert "shared-pkg" in captured.err, (
+            f"stderr must name the colliding package 'shared-pkg'; got: {captured.err!r}"
+        )
+
+
+@pytest.mark.integration
+class TestInstallLifecycleOrder:
+    """AC-FUNC-001: Full lifecycle order: init -> envsubst -> sync -> aggregate.
+
+    Verifies that the aggregate step (create .packages/) happens AFTER all
+    sources have been synced -- not interleaved. For a non-git store install()
+    does not write a .gitignore, so the store safety net is a no-op here.
+    """
+
+    def test_gitignore_written_after_sync_completes(self, tmp_path: pathlib.Path) -> None:
+        """A non-git store never gets a .gitignore, during or after install.
+
+        The store-safety-net .gitignore is written only when the store is inside
+        a git working tree. The isolated per-test store is not a git repo, so
+        .gitignore must not exist when repo_sync runs and must still not exist
+        after install() completes.
+        """
+        store_base = _store_base()
+        gitignore_existed_during_sync: list[bool] = []
+
+        def check_gitignore_during_sync(repo_dir: str, **kwargs: object) -> None:
+            gitignore_existed_during_sync.append((store_base / ".gitignore").exists())
+
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=check_gitignore_during_sync),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert len(gitignore_existed_during_sync) == 1, "repo_sync side-effect must run exactly once"
+        assert not gitignore_existed_during_sync[0], ".gitignore must NOT exist when repo_sync runs for a non-git store"
+        assert not (store_base / ".gitignore").exists(), (
+            ".gitignore must NOT exist after install() completes for a store that is not inside a git repo"
+        )
+
+    def test_packages_dir_created_after_sync_and_before_gitignore(self, tmp_path: pathlib.Path) -> None:
+        """.packages/ is created (aggregate step) after sync and before gitignore-update.
+
+        The aggregate step and gitignore-update both happen after the per-source
+        sync loop finishes. This test confirms .packages/ exists after install.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        store_base = _store_base()
+
+        packages_existed_during_sync: list[bool] = []
+
+        def check_packages_during_sync(repo_dir: str, **kwargs: object) -> None:
+            packages_existed_during_sync.append((store_base / ".packages").exists())
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=check_packages_during_sync),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        assert not packages_existed_during_sync[0], (
+            ".packages/ must NOT exist when repo_sync runs -- aggregate_symlinks runs after sync"
+        )
+        assert (store_base / ".packages").is_dir(), ".packages/ must exist after install() completes"
+
+    def test_full_lifecycle_stages_complete_in_order(self, tmp_path: pathlib.Path) -> None:
+        """Full lifecycle stages run in order: init -> envsubst -> sync -> aggregate.
+
+        Tracks filesystem state at each stage checkpoint to verify the order
+        of side effects in the install() implementation. For a non-git store,
+        install() does not invoke update_gitignore (the store safety net is a
+        no-op outside a git working tree), so the gitignore stage is absent.
+        """
+        stage_log: list[str] = []
+
+        def record_init(repo_dir: str, *args: object, **kwargs: object) -> None:
+            stage_log.append("init")
+
+        def record_envsubst(repo_dir: str, *args: object, **kwargs: object) -> None:
+            stage_log.append("envsubst")
+
+        def record_sync(repo_dir: str, **kwargs: object) -> None:
+            stage_log.append("sync")
+
+        original_aggregate = __import__("mpm_cli.core.install", fromlist=["aggregate_symlinks"]).aggregate_symlinks
+
+        def record_aggregate(source_names: list[str], base_dir: pathlib.Path) -> dict[str, str]:
+            stage_log.append("aggregate")
+            return original_aggregate(source_names, base_dir)
+
+        original_update_gitignore = __import__("mpm_cli.core.install", fromlist=["update_gitignore"]).update_gitignore
+
+        def record_update_gitignore(base_dir: pathlib.Path, entries: list[str]) -> None:
+            stage_log.append("gitignore")
+            original_update_gitignore(base_dir, entries)
+
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+
+        with (
+            patch("mpm_cli.repo.repo_init", side_effect=record_init),
+            patch("mpm_cli.repo.repo_envsubst", side_effect=record_envsubst),
+            patch("mpm_cli.repo.repo_sync", side_effect=record_sync),
+            patch("mpm_cli.core.install.aggregate_symlinks", side_effect=record_aggregate),
+            patch("mpm_cli.core.install.update_gitignore", side_effect=record_update_gitignore),
+        ):
+            install(mpmenv, lock_file_path=mpmenv.parent / ".mpm.lock")
+
+        expected_order = ["init", "envsubst", "sync", "aggregate"]
+        for step in expected_order:
+            assert step in stage_log, f"Lifecycle stage '{step}' must appear in the stage log"
+
+        init_pos = stage_log.index("init")
+        envsubst_pos = stage_log.index("envsubst")
+        sync_pos = stage_log.index("sync")
+        aggregate_pos = stage_log.index("aggregate")
+
+        assert init_pos < envsubst_pos, f"init must precede envsubst; stage_log={stage_log!r}"
+        assert envsubst_pos < sync_pos, f"envsubst must precede sync; stage_log={stage_log!r}"
+        assert sync_pos < aggregate_pos, f"sync must precede aggregate; stage_log={stage_log!r}"
+
+
+@pytest.mark.integration
+class TestInstallChannelDiscipline:
+    """AC-CHANNEL-001: stdout vs stderr discipline (no cross-channel leakage).
+
+    Progress messages from install must go to stdout. Error messages must go
+    to stderr. No progress text should appear on stderr; no error text should
+    appear on stdout.
+    """
+
+    def test_successful_install_writes_no_error_to_stderr(
+        self, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A successful install produces no output on stderr.
+
+        When install() completes without error, stderr must be empty.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        captured = capsys.readouterr()
+        assert captured.err == "", f"stderr must be empty on a successful install; got stderr={captured.err!r}"
+
+    def test_successful_install_writes_progress_to_stdout(
+        self, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A successful install writes progress messages to stdout.
+
+        install() must emit at least one progress message on stdout to confirm
+        it is running. The message must contain the word 'mpm'.
+        """
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        _install_with_patched_repo(mpmenv)
+
+        captured = capsys.readouterr()
+        assert "mpm" in captured.out, f"stdout must contain progress output from install; got stdout={captured.out!r}"
+
+    def test_failed_install_writes_error_to_stderr_not_stdout(
+        self, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture, make_install_args
+    ) -> None:
+        """When the CLI handler fails, the error message appears on stderr, not stdout.
+
+        A repo_sync failure must result in an error on stderr. The stdout
+        must not contain the word 'Error'.
+        """
+        from mpm_cli.repo import RepoCommandError
+
+        mpmenv = _write_single_source_mpmenv(tmp_path)
+        args = make_install_args(mpmenv.resolve())
+
+        with pytest.raises(SystemExit):
+            with (
+                patch("mpm_cli.repo.repo_init"),
+                patch("mpm_cli.repo.repo_envsubst"),
+                patch("mpm_cli.repo.repo_sync", side_effect=RepoCommandError("network timeout")),
+            ):
+                _install_run(args)
+
+        captured = capsys.readouterr()
+        assert "Error" in captured.err, f"stderr must contain 'Error' when install fails; got stderr={captured.err!r}"
+        assert "Error" not in captured.out, (
+            f"stdout must not contain 'Error' when install fails; got stdout={captured.out!r}"
+        )
+
+    def test_collision_error_written_to_stderr_not_stdout(
+        self, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture, make_install_args
+    ) -> None:
+        """Package collision errors are written to stderr, not stdout.
+
+        When a collision is detected, the CLI handler must write the collision
+        message to stderr and must not write it to stdout.
+        """
+        mpmenv = _write_two_source_mpmenv(tmp_path, "alpha", "bravo")
+
+        def fake_collision_sync(repo_dir: str, **kwargs: object) -> None:
+            pkg_dir = pathlib.Path(repo_dir) / ".packages" / "collision-pkg"
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+
+        args = make_install_args(mpmenv.resolve())
+        with pytest.raises(SystemExit):
+            with (
+                patch("mpm_cli.repo.repo_init"),
+                patch("mpm_cli.repo.repo_envsubst"),
+                patch("mpm_cli.repo.repo_sync", side_effect=fake_collision_sync),
+            ):
+                _install_run(args)
+
+        captured = capsys.readouterr()
+        assert "collision-pkg" in captured.err, (
+            f"Package collision error must name the colliding package in stderr; got stderr={captured.err!r}"
+        )
+        assert "collision-pkg" not in captured.out, (
+            f"Package collision error must NOT appear on stdout; got stdout={captured.out!r}"
+        )
