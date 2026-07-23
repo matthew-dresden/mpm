@@ -1,0 +1,372 @@
+"""Happy-path functional tests for 'mpm repo status'.
+
+Exercises the happy path of the 'repo status' subcommand by invoking
+``mpm repo status`` as a subprocess against a real initialized and synced
+repo directory created in a temporary directory. No mocking -- these tests
+use the full CLI stack against actual git operations.
+
+The 'repo status' subcommand compares the working tree to the staging area
+and the most recent commit on each project's HEAD. On a freshly synced
+repository with no uncommitted changes, it exits 0 and prints
+'nothing to commit (working directory clean)'.
+
+Covers:
+- AC-TEST-001: 'mpm repo status' with default args exits 0 in a valid repo.
+- AC-TEST-002: Every positional argument of 'repo status' has a happy-path test.
+- AC-FUNC-001: 'mpm repo status' executes successfully with documented default
+  behavior.
+- AC-CHANNEL-001: stdout vs stderr channel discipline (no cross-channel leakage).
+
+Tests are decorated with @pytest.mark.functional.
+"""
+
+import pathlib
+
+import pytest
+
+from tests.functional.conftest import (
+    _run_mpm,
+    _setup_synced_repo,
+)
+
+
+_GIT_USER_NAME = "Repo Status Happy Test User"
+_GIT_USER_EMAIL = "repo-status-happy@example.com"
+_MANIFEST_FILENAME = "default.xml"
+_PROJECT_NAME = "content-bare"
+_PROJECT_PATH = "status-happy-test-project"
+
+
+_EXPECTED_EXIT_CODE = 0
+
+
+_CLEAN_PHRASE = "nothing to commit (working directory clean)"
+
+
+_TRACEBACK_MARKER = "Traceback (most recent call last)"
+
+
+_ERROR_PREFIX = "Error:"
+
+
+_CLI_TOKEN_REPO = "repo"
+_CLI_TOKEN_STATUS = "status"
+_CLI_FLAG_REPO_DIR = "--repo-dir"
+
+
+@pytest.mark.functional
+class TestRepoStatusHappyPathDefaultArgs:
+    """AC-TEST-001 / AC-FUNC-001: 'mpm repo status' with default args exits 0.
+
+    Verifies that running 'mpm repo status' with no additional arguments
+    against a properly initialized and synced repo directory exits 0 and
+    prints the clean-status phrase to stdout when no uncommitted changes
+    exist in any project.
+    """
+
+    def test_repo_status_with_defaults_exits_zero(self, tmp_path: pathlib.Path) -> None:
+        """'mpm repo status' with no extra args must exit 0.
+
+        After a successful 'mpm repo init' and 'mpm repo sync', invokes
+        'mpm repo status' with no additional arguments. A freshly synced
+        repository has no uncommitted changes, so the command must exit 0.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, (
+            f"'mpm repo status' exited {result.returncode}, expected {_EXPECTED_EXIT_CODE}.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+
+    def test_repo_status_prints_clean_message_on_fresh_repo(self, tmp_path: pathlib.Path) -> None:
+        """'mpm repo status' must print the clean-status phrase on a fresh repo.
+
+        When all projects are clean (no uncommitted changes), the 'status'
+        subcommand emits the documented 'nothing to commit (working directory
+        clean)' phrase to stdout. This test verifies the documented default
+        behavior is exercised.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, (
+            f"Prerequisite 'mpm repo status' failed with exit {result.returncode}.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+        assert _CLEAN_PHRASE in result.stdout, (
+            f"Expected {_CLEAN_PHRASE!r} in stdout of 'mpm repo status' on a fresh repo.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+
+    def test_repo_status_produces_non_empty_output_on_fresh_repo(self, tmp_path: pathlib.Path) -> None:
+        """'mpm repo status' must produce non-empty combined output in a fresh repo.
+
+        A successful invocation on a freshly synced repo must produce at
+        least some output describing the status result. An empty combined
+        output would indicate the command ran without performing any work.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, f"Prerequisite 'mpm repo status' failed: {result.stderr!r}"
+        combined = result.stdout + result.stderr
+        assert len(combined) > 0, (
+            f"'mpm repo status' produced empty combined output.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+
+
+@pytest.mark.functional
+class TestRepoStatusPositionalArgHappyPath:
+    """AC-TEST-002: happy-path tests for the project name positional argument.
+
+    'repo status' accepts optional project names as positional arguments to
+    restrict the status display to specific projects. When a valid project
+    name from the manifest is supplied in a cleanly synced repository, the
+    command exits 0 because the project has no uncommitted changes.
+    """
+
+    def test_repo_status_with_project_name_exits_zero(self, tmp_path: pathlib.Path) -> None:
+        """'mpm repo status <project>' with a valid project name exits 0.
+
+        After a successful 'mpm repo init' and 'mpm repo sync', passes the
+        project name from the manifest as a positional argument to 'mpm repo
+        status'. The project has no uncommitted changes, so the command must
+        exit 0.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            _PROJECT_NAME,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, (
+            f"'mpm repo status {_PROJECT_NAME}' exited {result.returncode}, "
+            f"expected {_EXPECTED_EXIT_CODE}.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+
+    def test_repo_status_with_project_name_prints_clean_message(self, tmp_path: pathlib.Path) -> None:
+        """'mpm repo status <project>' must print the clean-status phrase.
+
+        When a valid project name is passed as a positional argument and the
+        project has no uncommitted changes, the 'status' subcommand must emit
+        the 'nothing to commit (working directory clean)' phrase to stdout
+        and exit 0.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            _PROJECT_NAME,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, (
+            f"Prerequisite 'mpm repo status {_PROJECT_NAME}' failed: {result.stderr!r}"
+        )
+        assert _CLEAN_PHRASE in result.stdout, (
+            f"Expected {_CLEAN_PHRASE!r} in stdout of 'mpm repo status {_PROJECT_NAME}'.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+
+    def test_repo_status_with_project_path_exits_zero(self, tmp_path: pathlib.Path) -> None:
+        """'mpm repo status <path>' with the project path alias exits 0.
+
+        Verifies that passing a project by its path (as an alternative to
+        the project name) also exits 0, exercising the path-based resolution
+        branch inside the 'status' subcommand's GetProjects call.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            _PROJECT_PATH,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, (
+            f"'mpm repo status {_PROJECT_PATH}' (path form) exited {result.returncode}, "
+            f"expected {_EXPECTED_EXIT_CODE}.\n"
+            f"  stdout: {result.stdout!r}\n"
+            f"  stderr: {result.stderr!r}"
+        )
+
+
+@pytest.mark.functional
+class TestRepoStatusChannelDiscipline:
+    """AC-CHANNEL-001: stdout vs stderr channel discipline for 'mpm repo status'.
+
+    Verifies that successful 'mpm repo status' invocations do not write
+    Python tracebacks or 'Error:' prefixed messages to stdout, and that
+    stderr does not contain Python exception tracebacks on a successful run.
+    """
+
+    def test_repo_status_success_has_no_traceback_on_stdout(self, tmp_path: pathlib.Path) -> None:
+        """Successful 'mpm repo status' must not emit Python tracebacks to stdout.
+
+        On success, stdout must not contain 'Traceback (most recent call last)'.
+        Tracebacks on stdout indicate an unhandled exception that escaped to
+        the wrong channel.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, f"Prerequisite 'mpm repo status' failed: {result.stderr!r}"
+        assert _TRACEBACK_MARKER not in result.stdout, (
+            f"Python traceback found in stdout of successful 'mpm repo status'.\n  stdout: {result.stdout!r}"
+        )
+
+    def test_repo_status_success_has_no_error_keyword_on_stdout(self, tmp_path: pathlib.Path) -> None:
+        """Successful 'mpm repo status' must not emit 'Error:' prefix to stdout.
+
+        Error-prefixed messages are a stderr-only concern. A successful
+        invocation must not produce any line starting with 'Error:' on stdout.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, f"Prerequisite 'mpm repo status' failed: {result.stderr!r}"
+        for line in result.stdout.splitlines():
+            assert not line.startswith(_ERROR_PREFIX), (
+                f"'{_ERROR_PREFIX}' line found in stdout of successful 'mpm repo status': {line!r}\n"
+                f"  stdout: {result.stdout!r}"
+            )
+
+    def test_repo_status_success_has_no_traceback_on_stderr(self, tmp_path: pathlib.Path) -> None:
+        """Successful 'mpm repo status' must not emit Python tracebacks to stderr.
+
+        On success, stderr must not contain 'Traceback (most recent call last)'.
+        A traceback on stderr during a successful run indicates an unhandled
+        exception was swallowed rather than propagated correctly.
+        """
+        checkout_dir, repo_dir = _setup_synced_repo(
+            tmp_path,
+            git_user_name=_GIT_USER_NAME,
+            git_user_email=_GIT_USER_EMAIL,
+            project_name=_PROJECT_NAME,
+            project_path=_PROJECT_PATH,
+            manifest_filename=_MANIFEST_FILENAME,
+        )
+
+        result = _run_mpm(
+            _CLI_TOKEN_REPO,
+            _CLI_FLAG_REPO_DIR,
+            str(repo_dir),
+            _CLI_TOKEN_STATUS,
+            cwd=checkout_dir,
+        )
+
+        assert result.returncode == _EXPECTED_EXIT_CODE, f"Prerequisite 'mpm repo status' failed: {result.stderr!r}"
+        assert _TRACEBACK_MARKER not in result.stderr, (
+            f"Python traceback found in stderr of successful 'mpm repo status'.\n  stderr: {result.stderr!r}"
+        )

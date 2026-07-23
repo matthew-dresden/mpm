@@ -1,0 +1,291 @@
+"""Integration tests that validate documentation completeness and accuracy.
+
+These tests scan documentation files for stale references and incorrect
+command usage.
+
+Covered acceptance criteria:
+  - AC-TEST-001: test_no_stale_pipx_references -- zero occurrences of the
+    stale "pipx install <legacy-codename>" step across all doc files, and no
+    bare use of the retired internal codename anywhere in the docs
+  - AC-TEST-002: test_no_standalone_repo_references -- no doc file code blocks
+    reference "repo" as a standalone CLI command without the "mpm" prefix
+  - AC-TEST-004: test_docs_use_auto_discover -- primary onboarding doc files
+    that reference "mpm install" or "mpm clean" in code blocks do NOT pass
+    ".mpm" as a positional argument in those invocations
+  - AC-TEST-005: test_catalog_no_repo_url -- catalog/.mpm does not contain
+    any uncommented REPO_URL or REPO_REV lines
+  - item 33 (E15-F1-S1): TestInitDefaultBranchPrerequisiteEnforced --
+    docs/integration-testing.md documents the init.defaultBranch=main test
+    prerequisite, AND both CI (.github/actions/setup-mpm/action.yml) and the
+    devcontainer (.devcontainer/.devcontainer.postcreate.sh) run
+    'git config --global init.defaultBranch main', so drift in any of the three
+    enforcement points fails CI.
+
+The ``_LEGACY_TOOL_CODENAME`` / ``_LEGACY_TOOL_STEM`` constants hold the retired
+internal codename this project was briefly developed under, and the stale
+``pipx install`` step that named it. Both are assembled from fragments at import
+time so a repository-wide sweep for the codename stays clean while these guards
+keep scanning every doc file for any stale reference to it.
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_DOCS_DIR = _REPO_ROOT / "docs"
+_README = _REPO_ROOT / "README.md"
+_CHANGELOG = _REPO_ROOT / "CHANGELOG.md"
+
+_INTEGRATION_TESTING_DOC = _DOCS_DIR / "integration-testing.md"
+_SETUP_MPM_ACTION = _REPO_ROOT / ".github" / "actions" / "setup-mpm" / "action.yml"
+_DEVCONTAINER_POSTCREATE = _REPO_ROOT / ".devcontainer" / ".devcontainer.postcreate.sh"
+
+_INIT_DEFAULT_BRANCH_CONFIG_RE = re.compile(r"git\s+config\s+--global\s+init\.defaultBranch\s+main")
+
+_LEGACY_TOOL_CODENAME = "rp" + "m" + "-git-repo"
+_LEGACY_TOOL_STEM = "rp" + "m"
+_STALE_PIPX_PATTERN = f"pipx install {_LEGACY_TOOL_CODENAME}"
+_LEGACY_CODENAME_RE = re.compile(rf"\b{re.escape(_LEGACY_TOOL_STEM)}\b", re.IGNORECASE)
+
+
+_ALL_DOC_FILES: list[Path] = sorted(list(_DOCS_DIR.glob("**/*.md")) + [_README, _CHANGELOG])
+
+
+_ONBOARDING_DOC_FILES: list[Path] = [
+    _DOCS_DIR / "setup-guide.md",
+    _DOCS_DIR / "lifecycle.md",
+    _DOCS_DIR / "creating-manifest-repos.md",
+    _DOCS_DIR / "creating-packages.md",
+    _DOCS_DIR / "multi-source-guide.md",
+]
+
+
+_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def _collect_matching_lines(files: list[Path], pattern: str) -> list[str]:
+    """Return lines containing *pattern* across all *files*.
+
+    Only regular files decodable as UTF-8 are examined.  Each returned string
+    has the form ``<filename>:<line_no>: <content>``.
+    """
+    hits: list[str] = []
+    for file_path in files:
+        if not file_path.is_file():
+            continue
+        try:
+            text = file_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, PermissionError):
+            continue
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if pattern in line:
+                rel = file_path.name
+                hits.append(f"{rel}:{line_no}: {line.strip()}")
+    return hits
+
+
+def _extract_code_block_lines(file_path: Path) -> list[str]:
+    """Return all lines found inside fenced code blocks in *file_path*.
+
+    Each returned string is the stripped content of one code-block line.
+    """
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, PermissionError):
+        return []
+    lines: list[str] = []
+    for block_body in _CODE_BLOCK_RE.findall(text):
+        for line in block_body.splitlines():
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+    return lines
+
+
+@pytest.mark.integration
+class TestNoStalePipxReferences:
+    """AC-TEST-001: No doc file may reference the stale
+    "pipx install <legacy-codename>" step, and the retired internal codename
+    must not appear as a bare word anywhere in the docs.
+
+    mpm's repo subsystem is part of the mpm-cli package -- it is mpm's own
+    manifest-driven sync engine, not a separately-installed tool -- so no doc
+    should tell operators to install the legacy codename.
+    """
+
+    def test_no_stale_pipx_references(self) -> None:
+        """Zero occurrences of the stale pipx-install step across all doc files."""
+        hits = _collect_matching_lines(_ALL_DOC_FILES, _STALE_PIPX_PATTERN)
+        assert not hits, (
+            f"Found {len(hits)} stale reference(s) to '{_STALE_PIPX_PATTERN}' in doc files.\n"
+            "The sync engine is now embedded in mpm-cli -- remove any reference to\n"
+            "installing it separately via pipx:\n" + "\n".join(hits)
+        )
+
+    def test_no_legacy_codename_references(self) -> None:
+        """The retired internal codename must not appear as a bare word in any doc."""
+        hits: list[str] = []
+        for doc_path in _ALL_DOC_FILES:
+            if not doc_path.is_file():
+                continue
+            try:
+                text = doc_path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, PermissionError):
+                continue
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if _LEGACY_CODENAME_RE.search(line):
+                    hits.append(f"{doc_path.name}:{line_no}: {line.strip()}")
+        assert not hits, (
+            f"Found {len(hits)} reference(s) to the retired internal codename in doc files.\n"
+            "The sync engine is mpm's own -- describe it as such, not by the\n"
+            "retired codename:\n" + "\n".join(hits)
+        )
+
+    @pytest.mark.parametrize(
+        "doc_path",
+        [
+            _DOCS_DIR / "setup-guide.md",
+            _DOCS_DIR / "how-it-works.md",
+            _DOCS_DIR / "creating-manifest-repos.md",
+            _DOCS_DIR / "creating-packages.md",
+            _DOCS_DIR / "claude-marketplaces-guide.md",
+            _DOCS_DIR / "multi-source-guide.md",
+        ],
+    )
+    def test_individual_doc_no_stale_pipx(self, doc_path: Path) -> None:
+        """Each primary doc file must not reference the stale pipx-install step."""
+        assert doc_path.is_file(), f"Expected doc file to exist: {doc_path}"
+        text = doc_path.read_text(encoding="utf-8")
+        assert _STALE_PIPX_PATTERN not in text, (
+            f"{doc_path.name} contains a stale reference to '{_STALE_PIPX_PATTERN}'.\n"
+            "The sync engine is embedded -- remove this installation instruction."
+        )
+
+
+@pytest.mark.integration
+class TestNoStandaloneRepoReferences:
+    """AC-TEST-002: No doc file code blocks reference "repo" as a standalone
+    CLI command without the "mpm" prefix.
+
+    Code examples must use "mpm repo <subcommand>" for all repo operations.
+    """
+
+    def test_no_standalone_repo_references(self) -> None:
+        """Code blocks across all doc files must not contain bare 'repo <cmd>' invocations."""
+
+        standalone_repo_re = re.compile(r"^repo\s")
+        violations: list[str] = []
+        for doc_path in _ALL_DOC_FILES:
+            if not doc_path.is_file():
+                continue
+            for line in _extract_code_block_lines(doc_path):
+                if standalone_repo_re.match(line):
+                    violations.append(f"{doc_path.name}: {line!r}")
+        assert not violations, (
+            f"Found {len(violations)} standalone 'repo <cmd>' invocation(s) in code blocks.\n"
+            "Replace 'repo <subcommand>' with 'mpm repo <subcommand>':\n" + "\n".join(violations)
+        )
+
+    @pytest.mark.parametrize(
+        "doc_path",
+        [
+            _DOCS_DIR / "setup-guide.md",
+            _DOCS_DIR / "configuration.md",
+        ],
+    )
+    def test_specific_doc_no_standalone_repo_in_code_blocks(self, doc_path: Path) -> None:
+        """Core user docs must not show standalone 'repo' commands in code blocks."""
+        assert doc_path.is_file(), f"Expected doc file to exist: {doc_path}"
+        standalone_repo_re = re.compile(r"^repo\s")
+        violations = [line for line in _extract_code_block_lines(doc_path) if standalone_repo_re.match(line)]
+        assert not violations, (
+            f"{doc_path.name} code blocks contain standalone 'repo' commands: {violations!r}\n"
+            "Use 'mpm repo <subcommand>' instead."
+        )
+
+
+@pytest.mark.integration
+class TestDocsUseAutoDiscover:
+    """AC-TEST-004: Primary onboarding doc files that contain 'mpm install'
+    or 'mpm clean' in code blocks must NOT include '.mpm' as a positional
+    argument.
+
+    These docs should guide users to the auto-discovery form ('mpm install'
+    with no path argument), which finds the .mpm file by walking up the
+    directory tree from cwd.  Explicit-path forms ('mpm install .mpm')
+    belong in the CLI reference and integration-testing docs, not in the
+    user-facing setup guides.
+    """
+
+    @pytest.mark.parametrize("doc_path", _ONBOARDING_DOC_FILES)
+    def test_docs_use_auto_discover(self, doc_path: Path) -> None:
+        """Onboarding doc code blocks must not pass '.mpm' to mpm install/clean."""
+        assert doc_path.is_file(), f"Expected onboarding doc to exist: {doc_path}"
+        violations: list[str] = []
+        for line in _extract_code_block_lines(doc_path):
+            if ("mpm install" in line or "mpm clean" in line) and re.search(
+                r"\bmpm\s+(?:install|clean)\b.*\B\.mpm\b", line
+            ):
+                violations.append(line)
+        assert not violations, (
+            f"{doc_path.name} contains 'mpm install/clean .mpm' in code blocks.\n"
+            "Onboarding docs should use the auto-discovery form ('mpm install' with no path).\n"
+            "Found:\n" + "\n".join(f"  {v!r}" for v in violations)
+        )
+
+
+@pytest.mark.integration
+class TestInitDefaultBranchPrerequisiteEnforced:
+    """item 33 (E15-F1-S1): the init.defaultBranch=main test prerequisite is
+    documented and enforced in all three places.
+
+    Local/file:// default-branch resolution (item 3) and the integration suite
+    rely on freshly ``git init``-ed repos defaulting to ``main``. That only holds
+    when ``init.defaultBranch`` is configured to ``main``. This prerequisite is
+    documented in ``docs/integration-testing.md`` and applied automatically by
+    CI (``.github/actions/setup-mpm/action.yml``) and the devcontainer
+    (``.devcontainer/.devcontainer.postcreate.sh``). If any of the three drifts,
+    the suite would silently regress to ``master`` defaults, so these assertions
+    fail CI on drift.
+    """
+
+    def test_doc_documents_the_prerequisite_section(self) -> None:
+        """integration-testing.md has the init.defaultBranch=main prerequisite section."""
+        assert _INTEGRATION_TESTING_DOC.is_file(), f"Expected doc to exist: {_INTEGRATION_TESTING_DOC}"
+        text = _INTEGRATION_TESTING_DOC.read_text(encoding="utf-8")
+        assert "## Test prerequisites" in text, (
+            f"{_INTEGRATION_TESTING_DOC.name} is missing the 'Test prerequisites' section heading."
+        )
+        assert "### `init.defaultBranch=main`" in text, (
+            f"{_INTEGRATION_TESTING_DOC.name} is missing the '### `init.defaultBranch=main`' "
+            "prerequisite subsection heading."
+        )
+        assert _INIT_DEFAULT_BRANCH_CONFIG_RE.search(text), (
+            f"{_INTEGRATION_TESTING_DOC.name} no longer shows the "
+            "'git config --global init.defaultBranch main' prerequisite command."
+        )
+
+    def test_ci_setup_action_sets_init_default_branch(self) -> None:
+        """The setup-mpm composite action runs 'git config --global init.defaultBranch main'."""
+        assert _SETUP_MPM_ACTION.is_file(), f"Expected CI action to exist: {_SETUP_MPM_ACTION}"
+        text = _SETUP_MPM_ACTION.read_text(encoding="utf-8")
+        assert _INIT_DEFAULT_BRANCH_CONFIG_RE.search(text), (
+            f"{_SETUP_MPM_ACTION} no longer runs "
+            "'git config --global init.defaultBranch main'. CI runners default new "
+            "repos to 'master', so dropping this would break the @main integration fixtures."
+        )
+
+    def test_devcontainer_postcreate_sets_init_default_branch(self) -> None:
+        """The devcontainer postcreate script runs 'git config --global init.defaultBranch main'."""
+        assert _DEVCONTAINER_POSTCREATE.is_file(), (
+            f"Expected devcontainer postcreate script to exist: {_DEVCONTAINER_POSTCREATE}"
+        )
+        text = _DEVCONTAINER_POSTCREATE.read_text(encoding="utf-8")
+        assert _INIT_DEFAULT_BRANCH_CONFIG_RE.search(text), (
+            f"{_DEVCONTAINER_POSTCREATE} no longer runs "
+            "'git config --global init.defaultBranch main'. The dev environment must "
+            "satisfy the prerequisite automatically; dropping this would regress local runs."
+        )

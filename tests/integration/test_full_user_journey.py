@@ -1,0 +1,1036 @@
+"""Comprehensive cross-cutting user journey tests for the full mpm lifecycle.
+
+Each test creates real local git repos (catalog, manifest, content), runs the
+full mpm CLI command chain via subprocess, and asserts on filesystem state,
+stdout/stderr output, and mock claude binary invocations where applicable.
+
+Tests marked @pytest.mark.integration exercise:
+  - write .mpm -> install -> clean roundtrips
+  - marketplace plugin lifecycle with a mock claude binary
+  - validate xml and validate marketplace subcommands
+  - version constraint resolution
+  - auto-discovery from nested subdirectories
+  - multi-source installs with and without marketplace
+  - env var override of .mpm values
+  - idempotent install (install twice, clean once)
+  - error recovery from partial installs
+  - deprecation warnings for legacy REPO_URL / REPO_REV keys
+"""
+
+import json
+import os
+import pathlib
+import stat
+import subprocess
+from unittest.mock import patch
+
+import pytest
+
+from mpm_cli.core.clean import clean
+from mpm_cli.core.discover import find_mpmenv
+from mpm_cli.core.install import install
+from mpm_cli.repo import RepoCommandError
+from tests.functional.conftest import _run_mpm
+
+
+_GIT_USER_NAME = "Journey Test User"
+_GIT_USER_EMAIL = "journey-test@example.com"
+_MANIFEST_FILENAME = "default.xml"
+_CONTENT_FILE_NAME = "README.md"
+_CONTENT_FILE_TEXT = "hello from journey content repo"
+_MARKETPLACE_NAME = "test-marketplace"
+_PLUGIN_NAME = "test-plugin"
+_MARKETPLACE_DIR_REL = ".claude-marketplaces"
+
+
+_EMPTY_MANIFEST_XML = '<?xml version="1.0" encoding="UTF-8"?>\n<manifest></manifest>\n'
+
+
+def _git(args: list[str], cwd: pathlib.Path) -> None:
+    """Run a git command in cwd, raising RuntimeError on non-zero exit.
+
+    Args:
+        args: Git subcommand and arguments (without the 'git' prefix).
+        cwd: Working directory for the git command.
+
+    Raises:
+        RuntimeError: When the git command exits with a non-zero code.
+    """
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {args!r} failed in {cwd!r}:\n  stdout: {result.stdout!r}\n  stderr: {result.stderr!r}")
+
+
+def _init_git_work_dir(work_dir: pathlib.Path) -> None:
+    """Initialise a git working directory with user config set.
+
+    Args:
+        work_dir: The directory to initialise as a git repo.
+    """
+    _git(["init", "-b", "main"], cwd=work_dir)
+    _git(["config", "user.name", _GIT_USER_NAME], cwd=work_dir)
+    _git(["config", "user.email", _GIT_USER_EMAIL], cwd=work_dir)
+
+
+def _clone_as_bare(work_dir: pathlib.Path, bare_dir: pathlib.Path) -> pathlib.Path:
+    """Clone work_dir into bare_dir and return bare_dir resolved.
+
+    Args:
+        work_dir: The source non-bare working directory.
+        bare_dir: The destination path for the bare clone.
+
+    Returns:
+        The resolved absolute path to the bare clone.
+    """
+    _git(["clone", "--bare", str(work_dir), str(bare_dir)], cwd=work_dir.parent)
+    return bare_dir.resolve()
+
+
+def _create_bare_content_repo(base: pathlib.Path, subdir: str = "content") -> pathlib.Path:
+    """Create a bare git repo containing one committed file.
+
+    Args:
+        base: Parent directory under which repos are created.
+        subdir: Subdirectory prefix for work/bare dirs.
+
+    Returns:
+        The absolute path to the bare content repository.
+    """
+    work_dir = base / f"{subdir}-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _init_git_work_dir(work_dir)
+    (work_dir / _CONTENT_FILE_NAME).write_text(_CONTENT_FILE_TEXT, encoding="utf-8")
+    _git(["add", _CONTENT_FILE_NAME], cwd=work_dir)
+    _git(["commit", "-m", "Initial commit"], cwd=work_dir)
+    return _clone_as_bare(work_dir, base / f"{subdir}-bare.git")
+
+
+def _create_bare_content_repo_with_tags(
+    base: pathlib.Path,
+    tags: list[str],
+    subdir: str = "tagged-content",
+) -> pathlib.Path:
+    """Create a bare git repo with multiple annotated version tags.
+
+    Args:
+        base: Parent directory under which repos are created.
+        tags: Annotated tag names to create (e.g. ["1.0.0", "1.1.0", "2.0.0"]).
+        subdir: Subdirectory prefix for work/bare dirs.
+
+    Returns:
+        The absolute path to the bare content repository.
+    """
+    work_dir = base / f"{subdir}-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _init_git_work_dir(work_dir)
+    (work_dir / _CONTENT_FILE_NAME).write_text(_CONTENT_FILE_TEXT, encoding="utf-8")
+    _git(["add", _CONTENT_FILE_NAME], cwd=work_dir)
+    _git(["commit", "-m", "Base commit"], cwd=work_dir)
+    for tag in tags:
+        _git(["tag", "-a", tag, "-m", f"Release {tag}"], cwd=work_dir)
+    return _clone_as_bare(work_dir, base / f"{subdir}-bare.git")
+
+
+def _write_manifest_xml(
+    work_dir: pathlib.Path,
+    fetch_base: str,
+    projects: list[dict],
+    default_revision: str = "main",
+) -> None:
+    """Write a default.xml manifest file to work_dir.
+
+    Each project dict must have 'name' and 'path' keys. Optional keys:
+    - 'revision': overrides the default revision for this project.
+    - 'linkfile_src' + 'linkfile_dest': creates a <linkfile> child element.
+
+    Args:
+        work_dir: Directory in which to write the manifest.
+        fetch_base: Value for the remote fetch attribute.
+        projects: List of project descriptor dicts.
+        default_revision: Default revision for the <default> element.
+    """
+    project_elements = []
+    for proj in projects:
+        revision_attr = f' revision="{proj["revision"]}"' if "revision" in proj else ""
+        children = []
+        if "linkfile_src" in proj:
+            children.append(f'    <linkfile src="{proj["linkfile_src"]}" dest="{proj["linkfile_dest"]}" />')
+        if children:
+            project_open = f'  <project name="{proj["name"]}" path="{proj["path"]}"{revision_attr}>'
+            project_elements.append(project_open)
+            project_elements.extend(children)
+            project_elements.append("  </project>")
+        else:
+            project_elements.append(f'  <project name="{proj["name"]}" path="{proj["path"]}"{revision_attr} />')
+
+    projects_xml = "\n".join(project_elements)
+    manifest_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<manifest>\n"
+        f'  <remote name="local" fetch="{fetch_base}" />\n'
+        f'  <default revision="{default_revision}" remote="local" />\n'
+        f"{projects_xml}\n"
+        "</manifest>\n"
+    )
+    (work_dir / _MANIFEST_FILENAME).write_text(manifest_xml, encoding="utf-8")
+
+
+def _create_manifest_repo(
+    base: pathlib.Path,
+    fetch_base: str,
+    projects: list[dict],
+    default_revision: str = "main",
+    subdir_name: str = "manifest",
+) -> pathlib.Path:
+    """Create a bare manifest git repo with the given projects in its manifest.
+
+    Args:
+        base: Parent directory under which repos are created.
+        fetch_base: Value for the remote fetch attribute.
+        projects: List of project descriptors passed to _write_manifest_xml.
+        default_revision: Default revision for the <default> element.
+        subdir_name: Unique subdirectory prefix to avoid name collisions.
+
+    Returns:
+        The absolute path to the bare manifest repository.
+    """
+    work_dir = base / f"{subdir_name}-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _init_git_work_dir(work_dir)
+    _write_manifest_xml(work_dir, fetch_base, projects, default_revision=default_revision)
+    _git(["add", _MANIFEST_FILENAME], cwd=work_dir)
+    _git(["commit", "-m", "Add manifest"], cwd=work_dir)
+    return _clone_as_bare(work_dir, base / f"{subdir_name}-bare.git")
+
+
+def _create_mock_claude_binary(bin_dir: pathlib.Path) -> pathlib.Path:
+    """Create a mock claude binary that logs all invocations to a file.
+
+    The mock binary writes each invocation's argument list (JSON) to
+    bin_dir/claude-invocations.json as a newline-delimited JSON file.
+    It always exits 0 so claude marketplace add, plugin install, etc., succeed.
+
+    Args:
+        bin_dir: Directory in which to place the mock claude script.
+
+    Returns:
+        The path to the mock claude binary.
+    """
+    log_file = bin_dir / "claude-invocations.jsonl"
+    mock_claude = bin_dir / "claude"
+    mock_claude.write_text(
+        f'#!/bin/sh\necho "$@" >> {log_file}\nexit 0\n',
+        encoding="utf-8",
+    )
+    mock_claude.chmod(mock_claude.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return mock_claude
+
+
+def _read_claude_invocations(bin_dir: pathlib.Path) -> list[str]:
+    """Read logged claude invocations from the mock binary's log file.
+
+    Args:
+        bin_dir: Directory where the mock claude binary was created.
+
+    Returns:
+        List of argument strings, one per invocation.
+    """
+    log_file = bin_dir / "claude-invocations.jsonl"
+    if not log_file.exists():
+        return []
+    return [line.strip() for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _write_empty_manifest(repo_dir: str, manifest_filename: str = _MANIFEST_FILENAME) -> None:
+    """Write a minimal empty manifest XML under repo_dir/.repo/manifests/manifest_filename.
+
+    After repo init + repo sync, manifest files live at source_dir/.repo/manifests/
+    (the repo tool's manifest checkout dir). This helper mirrors that layout so
+    install()'s include-walker finds the manifest at the expected location.
+
+    Args:
+        repo_dir: The source directory passed by install() to repo_sync.
+        manifest_filename: Manifest file name relative to the manifests repo root.
+    """
+    manifest_path = pathlib.Path(repo_dir) / ".repo" / "manifests" / manifest_filename
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(_EMPTY_MANIFEST_XML, encoding="utf-8")
+
+
+@pytest.mark.integration
+class TestFullJourneyBootstrapInstallClean:
+    """AC-TEST-001: write .mpm directly -> install -> verify -> clean -> verify clean state."""
+
+    def test_full_journey_bootstrap_install_clean(self, tmp_path: pathlib.Path) -> None:
+        """Create a real catalog repo, write .mpm directly, install, then clean.
+
+        Steps:
+        1. Create a bare content repo with one committed file.
+        2. Create a bare manifest repo referencing the content repo.
+        3. Create a local catalog repo with a .mpm pointing at the manifest repo.
+        4. Create a project directory and write .mpm directly from the catalog template.
+        5. Run: mpm install (with mocked repo operations so no network needed).
+        6. Verify the shared store has .packages/ populated and .mpm-data/
+           created, and no .gitignore under the non-git store.
+        7. Run: mpm clean.
+        8. Verify the store .packages/ gone, .mpm-data/ gone.
+        """
+        repos_dir = tmp_path / "repos"
+        repos_dir.mkdir()
+
+        bare_content = _create_bare_content_repo(repos_dir)
+        fetch_base = f"file://{bare_content.parent}"
+        manifest_bare = _create_manifest_repo(
+            repos_dir,
+            fetch_base,
+            [{"name": "content-bare", "path": "my-content"}],
+        )
+
+        mpmenv_content = (
+            f"MPM_SOURCE_main_URL=file://{manifest_bare}\n"
+            "MPM_SOURCE_main_REF=main\n"
+            "MPM_SOURCE_main_PATH=default.xml\n"
+            "MPM_SOURCE_main_NAME=main\n"
+            "MPM_SOURCE_main_GITBASE=https://example.com\n"
+        )
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(mpmenv_content, encoding="utf-8")
+        assert mpmenv_path.is_file(), ".mpm must exist"
+
+        def fake_repo_sync(repo_dir: str, **kwargs) -> None:
+            repo_path = pathlib.Path(repo_dir)
+            _write_empty_manifest(repo_dir)
+            pkg = repo_path / ".packages" / "synced-pkg"
+            pkg.mkdir(parents=True, exist_ok=True)
+            (pkg / "tool.sh").write_text("#!/bin/sh\necho tool\n")
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync),
+            patch.dict("os.environ", {"MPM_ALLOW_INSECURE_REMOTES": "1"}),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert (store_base / ".packages").is_dir(), ".packages/ must exist in the store after install"
+        assert (store_base / ".packages" / "synced-pkg").is_symlink(), (
+            ".packages/synced-pkg must be a symlink in the store after install"
+        )
+        assert (store_base / ".mpm-data").is_dir(), ".mpm-data/ must exist in the store after install"
+        assert not (store_base / ".gitignore").exists(), "install() must not write .gitignore under a non-git store"
+
+        clean(mpmenv_path)
+
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+        assert mpmenv_path.is_file(), ".mpm must survive clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyBootstrapInstallMarketplaceClean:
+    """AC-TEST-002: bootstrap -> install with marketplace -> verify -> clean."""
+
+    def test_full_journey_bootstrap_install_marketplace_clean(self, tmp_path: pathlib.Path) -> None:
+        """Full journey with MPM_MARKETPLACE_INSTALL=true and a mock claude binary.
+
+        Steps:
+        1. Create a mock claude binary that logs invocations.
+        2. Create a content repo with marketplace structure.
+        3. Create a manifest repo with a linkfile element.
+        4. Bootstrap a project with a .mpm pointing at the manifest repo.
+        5. Run mpm install with MPM_MARKETPLACE_INSTALL=true and the mock claude
+           on PATH. Verify marketplace dir created, linkfile symlinks exist,
+           mock claude received marketplace add and plugin install calls.
+        6. Run mpm clean. Verify mock claude received plugin uninstall and
+           marketplace remove calls, and marketplace dir cleaned.
+        """
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        _create_mock_claude_binary(bin_dir)
+
+        marketplaces_dir = tmp_path / "project" / _MARKETPLACE_DIR_REL
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            f"CLAUDE_MARKETPLACES_DIR={marketplaces_dir}\n"
+            f"MPM_SOURCE_mp_URL=https://example.com/mp.git\n"
+            f"MPM_SOURCE_mp_REF=main\n"
+            f"MPM_SOURCE_mp_PATH=default.xml\n"
+            f"MPM_SOURCE_mp_NAME=mp\n"
+            f"MPM_SOURCE_mp_GITBASE=https://example.com\n"
+            f"MPM_SOURCE_mp_MARKETPLACE=true\n",
+            encoding="utf-8",
+        )
+
+        install_calls: list[str] = []
+        uninstall_calls: list[str] = []
+        register_calls: list[str] = []
+        remove_calls: list[str] = []
+
+        def fake_repo_sync_mp(repo_dir: str, **kwargs) -> None:
+            _write_empty_manifest(repo_dir)
+            mp_dir = marketplaces_dir / _MARKETPLACE_NAME
+            mp_dir.mkdir(parents=True, exist_ok=True)
+            cp_dir = mp_dir / ".claude-plugin"
+            cp_dir.mkdir(exist_ok=True)
+            manifest = {
+                "name": _MARKETPLACE_NAME,
+                "plugins": [{"name": _PLUGIN_NAME}],
+            }
+            (cp_dir / "marketplace.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync_mp),
+            patch(
+                "mpm_cli.core.marketplace.locate_claude_binary",
+                return_value=str(bin_dir / "claude"),
+            ),
+            patch(
+                "mpm_cli.core.marketplace.register_marketplace",
+                side_effect=lambda claude, mp: register_calls.append(str(mp)) or True,
+            ),
+            patch(
+                "mpm_cli.core.marketplace.install_plugin",
+                side_effect=lambda claude, pname, mpname: install_calls.append(f"{pname}@{mpname}") or True,
+            ),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        assert len(register_calls) >= 1, f"Expected at least one marketplace register call, got: {register_calls!r}"
+        assert len(install_calls) >= 1, f"Expected at least one plugin install call, got: {install_calls!r}"
+
+        with (
+            patch(
+                "mpm_cli.core.marketplace.locate_claude_binary",
+                return_value=str(bin_dir / "claude"),
+            ),
+            patch(
+                "mpm_cli.core.marketplace.uninstall_plugin",
+                side_effect=lambda claude, pname, mpname: uninstall_calls.append(f"{pname}@{mpname}") or True,
+            ),
+            patch(
+                "mpm_cli.core.marketplace.remove_marketplace",
+                side_effect=lambda claude, mpname: remove_calls.append(mpname) or True,
+            ),
+        ):
+            clean(mpmenv_path)
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert len(uninstall_calls) >= 1, f"Expected at least one plugin uninstall call, got: {uninstall_calls!r}"
+        assert len(remove_calls) >= 1, f"Expected at least one marketplace remove call, got: {remove_calls!r}"
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyBootstrapInstallValidateClean:
+    """AC-TEST-003: bootstrap -> install -> validate xml -> validate marketplace -> clean."""
+
+    def test_full_journey_bootstrap_install_validate_clean(self, tmp_path: pathlib.Path) -> None:
+        """Full journey proving all subsystems work together.
+
+        Steps:
+        1. Create a manifest repo whose manifest XML is well-formed and valid.
+        2. Create a marketplace XML file for validate marketplace.
+        3. Bootstrap a project.
+        4. Install (with mocked repo ops).
+        5. Run mpm validate xml --repo-root on a repo with repo-specs/ XML.
+        6. Run mpm validate marketplace --repo-root on a repo with marketplace XML.
+        7. Clean and verify clean state.
+        """
+        repos_dir = tmp_path / "repos"
+        repos_dir.mkdir()
+
+        manifest_work = repos_dir / "repo-with-specs-work"
+        manifest_work.mkdir()
+        _init_git_work_dir(manifest_work)
+
+        repo_specs = manifest_work / "repo-specs"
+        repo_specs.mkdir()
+
+        valid_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<manifest>\n"
+            '  <remote name="origin" fetch="https://github.com/example-org/" />\n'
+            '  <default revision="main" remote="origin" />\n'
+            '  <project name="my-repo" path="my-repo" remote="origin" revision="main" />\n'
+            "</manifest>\n"
+        )
+        (repo_specs / "meta.xml").write_text(valid_xml, encoding="utf-8")
+
+        marketplace_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<manifest>\n"
+            '  <remote name="origin" fetch="https://example.invalid/example-org/" />\n'
+            '  <default revision="refs/tags/some-plugin/1.0.0" remote="origin" />\n'
+            "  <project\n"
+            '    name="some-plugin"\n'
+            '    path="some-plugin-path"\n'
+            '    remote="origin"\n'
+            '    revision="refs/tags/some-plugin/1.0.0"\n'
+            "  >\n"
+            '    <linkfile src="plugin.sh" dest="${CLAUDE_MARKETPLACES_DIR}/some-plugin.sh" />\n'
+            "  </project>\n"
+            "  <catalog-metadata>\n"
+            "    <name>some-plugin</name>\n"
+            "    <display-name>Some Plugin</display-name>\n"
+            "    <description>d</description>\n"
+            "    <version>1.0.0</version>\n"
+            "  </catalog-metadata>\n"
+            "</manifest>\n"
+        )
+        (repo_specs / "test-marketplace.xml").write_text(marketplace_xml, encoding="utf-8")
+
+        _git(["add", "."], cwd=manifest_work)
+        _git(["commit", "-m", "Add repo-specs"], cwd=manifest_work)
+        manifest_repo_bare = _clone_as_bare(manifest_work, repos_dir / "manifest-bare.git")
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            f"MPM_SOURCE_main_URL=file://{manifest_repo_bare}\n"
+            "MPM_SOURCE_main_REF=main\n"
+            "MPM_SOURCE_main_PATH=default.xml\n"
+            "MPM_SOURCE_main_NAME=main\n"
+            "MPM_SOURCE_main_GITBASE=https://example.com\n",
+            encoding="utf-8",
+        )
+
+        def fake_repo_sync_validate(repo_dir: str, **kwargs) -> None:
+            _write_empty_manifest(repo_dir)
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync_validate),
+            patch.dict("os.environ", {"MPM_ALLOW_INSECURE_REMOTES": "1"}),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert (store_base / ".mpm-data").is_dir(), ".mpm-data/ must exist in the store after install"
+
+        xml_result = _run_mpm(
+            "validate",
+            "xml",
+            "--repo-root",
+            str(manifest_work),
+        )
+        assert xml_result.returncode == 0, (
+            f"mpm validate xml failed with exit {xml_result.returncode}.\n"
+            f"  stdout: {xml_result.stdout!r}\n"
+            f"  stderr: {xml_result.stderr!r}"
+        )
+
+        mp_result = _run_mpm(
+            "validate",
+            "marketplace",
+            "--repo-root",
+            str(manifest_work),
+        )
+        assert mp_result.returncode == 0, (
+            f"mpm validate marketplace failed with exit {mp_result.returncode}.\n"
+            f"  stdout: {mp_result.stdout!r}\n"
+            f"  stderr: {mp_result.stderr!r}"
+        )
+
+        clean(mpmenv_path)
+
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyWithVersionConstraints:
+    """AC-TEST-004: bootstrap with catalog tag constraints -> install -> verify -> clean."""
+
+    def test_full_journey_with_version_constraints(self, tmp_path: pathlib.Path) -> None:
+        """Version constraint in .mpm source revision resolves to the correct tag.
+
+        Steps:
+        1. Create a manifest repo bare with tags 1.0.0 and 1.1.0 and 2.0.0.
+        2. Create a .mpm with MPM_SOURCE_main_REF=refs/tags/>=1.0.0,<2.0.0.
+        3. Mock resolve_version to return refs/tags/1.1.0 (highest matching).
+        4. Run install. Verify the mock was called with the constraint.
+        5. Clean. Verify clean state.
+        """
+        repos_dir = tmp_path / "repos"
+        repos_dir.mkdir()
+
+        bare_content = _create_bare_content_repo_with_tags(repos_dir, ["1.0.0", "1.1.0", "2.0.0"])
+        fetch_base = f"file://{bare_content.parent}"
+        manifest_bare = _create_manifest_repo(
+            repos_dir,
+            fetch_base,
+            [{"name": "tagged-content-bare", "path": "versioned-content"}],
+        )
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        mpmenv_path = project_dir / ".mpm"
+        constraint = "refs/tags/>=1.0.0,<2.0.0"
+        mpmenv_path.write_text(
+            f"MPM_SOURCE_main_URL=file://{manifest_bare}\n"
+            f"MPM_SOURCE_main_REF={constraint}\n"
+            "MPM_SOURCE_main_PATH=default.xml\n"
+            "MPM_SOURCE_main_NAME=main\n"
+            "MPM_SOURCE_main_GITBASE=https://example.com\n",
+            encoding="utf-8",
+        )
+
+        resolved_calls: list[tuple[str, str]] = []
+
+        def fake_resolve_version(url: str, rev_spec: str) -> str:
+            resolved_calls.append((url, rev_spec))
+            return "refs/tags/1.1.0"
+
+        def fake_repo_sync_version(repo_dir: str, **kwargs) -> None:
+            _write_empty_manifest(repo_dir)
+
+        with (
+            patch("mpm_cli.core.install.resolve_version", side_effect=fake_resolve_version),
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync_version),
+            patch.dict("os.environ", {"MPM_ALLOW_INSECURE_REMOTES": "1"}),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        assert len(resolved_calls) == 1, f"resolve_version must be called once per source, got: {resolved_calls!r}"
+        called_rev_spec = resolved_calls[0][1]
+        assert called_rev_spec == constraint, (
+            f"Expected resolve_version called with {constraint!r}, got {called_rev_spec!r}"
+        )
+
+        clean(mpmenv_path)
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyAutoDiscoverFromSubdirectory:
+    """AC-TEST-005: .mpm in project root, install from nested subdir, auto-discovery."""
+
+    def test_full_journey_auto_discover_from_subdirectory(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """bootstrap in /tmp/project/ then install/clean from /tmp/project/src/deep/nested/.
+
+        Steps:
+        1. Write .mpm in project/.
+        2. Create project/src/deep/nested/ subdirectory.
+        3. Change cwd to the nested subdir.
+        4. Call install (with auto-discovery via find_mpmenv) from nested dir.
+        5. Verify .packages/ and .mpm-data/ created in the shared store.
+        6. Call clean from nested dir (using auto-discovery).
+        7. Verify clean state in the shared store.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            "MPM_SOURCE_build_URL=https://example.com/build.git\n"
+            "MPM_SOURCE_build_REF=main\n"
+            "MPM_SOURCE_build_PATH=default.xml\n"
+            "MPM_SOURCE_build_NAME=build\n"
+            "MPM_SOURCE_build_GITBASE=https://example.com\n",
+            encoding="utf-8",
+        )
+
+        nested_dir = project_dir / "src" / "deep" / "nested"
+        nested_dir.mkdir(parents=True)
+        monkeypatch.chdir(nested_dir)
+
+        discovered = find_mpmenv(start_dir=nested_dir)
+        assert discovered == mpmenv_path.resolve(), (
+            f"Auto-discovery from {nested_dir!r} must resolve to {mpmenv_path.resolve()!r}, but got {discovered!r}"
+        )
+
+        def fake_repo_sync(repo_dir: str, **kwargs) -> None:
+            repo_path = pathlib.Path(repo_dir)
+            _write_empty_manifest(repo_dir)
+            pkg = repo_path / ".packages" / "auto-pkg"
+            pkg.mkdir(parents=True, exist_ok=True)
+            (pkg / "script.sh").write_text("#!/bin/sh\necho auto\n")
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync),
+        ):
+            install(
+                discovered,
+                lock_file_path=discovered.parent / ".mpm.lock",
+            )
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert (store_base / ".packages").is_dir(), ".packages/ must be created in the shared store"
+        assert (store_base / ".packages" / "auto-pkg").is_symlink(), ".packages/auto-pkg must be a symlink in the store"
+        assert (store_base / ".mpm-data").is_dir(), ".mpm-data/ must be created in the shared store"
+
+        clean(discovered)
+
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyMultiSourceWithMarketplace:
+    """AC-TEST-006: multi-source install -- one marketplace, one non-marketplace source."""
+
+    def test_full_journey_multi_source_with_marketplace(self, tmp_path: pathlib.Path) -> None:
+        """Two sources: one triggers marketplace plugin lifecycle, one does not.
+
+        Steps:
+        1. Create .mpm with two sources: 'pkgs' (non-marketplace) and 'mp' (marketplace).
+        2. Set MPM_MARKETPLACE_INSTALL=true and CLAUDE_MARKETPLACES_DIR.
+        3. Run install -- verify both sources synced, marketplace lifecycle triggered.
+        4. Run clean -- verify all cleaned.
+        """
+        marketplaces_dir = tmp_path / "project" / _MARKETPLACE_DIR_REL
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            f"CLAUDE_MARKETPLACES_DIR={marketplaces_dir}\n"
+            "MPM_SOURCE_mp_URL=https://example.com/mp.git\n"
+            "MPM_SOURCE_mp_REF=main\n"
+            "MPM_SOURCE_mp_PATH=default.xml\n"
+            "MPM_SOURCE_mp_NAME=mp\n"
+            "MPM_SOURCE_mp_GITBASE=https://example.com\n"
+            "MPM_SOURCE_mp_MARKETPLACE=true\n"
+            "MPM_SOURCE_pkgs_URL=https://example.com/pkgs.git\n"
+            "MPM_SOURCE_pkgs_REF=main\n"
+            "MPM_SOURCE_pkgs_PATH=meta.xml\n"
+            "MPM_SOURCE_pkgs_NAME=pkgs\n"
+            "MPM_SOURCE_pkgs_GITBASE=https://example.com\n",
+            encoding="utf-8",
+        )
+
+        synced_sources: list[str] = []
+
+        def fake_repo_sync(repo_dir: str, **kwargs) -> None:
+            repo_path = pathlib.Path(repo_dir)
+            source_name = repo_path.name
+            synced_sources.append(source_name)
+            if source_name == "mp":
+                _write_empty_manifest(repo_dir)
+                mp_dir = marketplaces_dir / _MARKETPLACE_NAME
+                mp_dir.mkdir(parents=True, exist_ok=True)
+                cp_dir = mp_dir / ".claude-plugin"
+                cp_dir.mkdir(exist_ok=True)
+                manifest = {
+                    "name": _MARKETPLACE_NAME,
+                    "plugins": [{"name": _PLUGIN_NAME}],
+                }
+                (cp_dir / "marketplace.json").write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+            else:
+                _write_empty_manifest(repo_dir, manifest_filename="meta.xml")
+                pkg = repo_path / ".packages" / "non-mp-pkg"
+                pkg.mkdir(parents=True, exist_ok=True)
+                (pkg / "tool.sh").write_text("#!/bin/sh\necho tool\n")
+
+        install_calls: list[str] = []
+        uninstall_calls: list[str] = []
+        register_calls: list[str] = []
+        remove_calls: list[str] = []
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync),
+            patch(
+                "mpm_cli.core.marketplace.locate_claude_binary",
+                return_value="/usr/local/bin/claude",
+            ),
+            patch(
+                "mpm_cli.core.marketplace.register_marketplace",
+                side_effect=lambda claude, mp: register_calls.append(str(mp)) or True,
+            ),
+            patch(
+                "mpm_cli.core.marketplace.install_plugin",
+                side_effect=lambda claude, pname, mpname: install_calls.append(pname) or True,
+            ),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert "mp" in synced_sources, f"'mp' source must be synced, got: {synced_sources!r}"
+        assert "pkgs" in synced_sources, f"'pkgs' source must be synced, got: {synced_sources!r}"
+        assert len(register_calls) >= 1, f"Expected marketplace register call, got: {register_calls!r}"
+        assert (store_base / ".packages" / "non-mp-pkg").is_symlink(), (
+            ".packages/non-mp-pkg must be a symlink in the store from the pkgs source"
+        )
+
+        with (
+            patch(
+                "mpm_cli.core.marketplace.locate_claude_binary",
+                return_value="/usr/local/bin/claude",
+            ),
+            patch(
+                "mpm_cli.core.marketplace.uninstall_plugin",
+                side_effect=lambda claude, pname, mpname: uninstall_calls.append(pname) or True,
+            ),
+            patch(
+                "mpm_cli.core.marketplace.remove_marketplace",
+                side_effect=lambda claude, mpname: remove_calls.append(mpname) or True,
+            ),
+        ):
+            clean(mpmenv_path)
+
+        assert len(uninstall_calls) >= 1, f"Expected plugin uninstall call during clean, got: {uninstall_calls!r}"
+        assert len(remove_calls) >= 1, f"Expected marketplace remove call during clean, got: {remove_calls!r}"
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyEnvVarOverrides:
+    """AC-TEST-007: per-alias _GITBASE env var overrides .mpm value during install."""
+
+    def test_full_journey_env_var_overrides(self, tmp_path: pathlib.Path) -> None:
+        """Env var override of a source's per-alias _GITBASE is applied during envsubst.
+
+        ``mpm add`` records the org base per dependency in
+        ``MPM_SOURCE_<alias>_GITBASE`` and writes no global ``GITBASE`` line, so
+        install promotes the source's per-alias value into ``GITBASE`` for that
+        source's substitution. CI/CD can override a dependency's base by setting
+        ``MPM_SOURCE_<alias>_GITBASE`` in the environment (env values take
+        precedence over file values).
+
+        Steps:
+        1. Create .mpm with MPM_SOURCE_main_GITBASE=default-base.
+        2. Run install with MPM_SOURCE_main_GITBASE=override-base in environment.
+        3. Verify repo_envsubst was called with env_vars containing GITBASE=override-base.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            "MPM_SOURCE_main_URL=https://example.com/repo.git\n"
+            "MPM_SOURCE_main_REF=main\n"
+            "MPM_SOURCE_main_PATH=default.xml\n"
+            "MPM_SOURCE_main_NAME=main\n"
+            "MPM_SOURCE_main_GITBASE=default-base\n",
+            encoding="utf-8",
+        )
+
+        envsubst_calls: list[dict] = []
+
+        def fake_repo_envsubst(repo_dir: str, env_vars: dict) -> None:
+            envsubst_calls.append(dict(env_vars))
+
+        def fake_repo_sync_env(repo_dir: str, **kwargs) -> None:
+            _write_empty_manifest(repo_dir)
+
+        original_gitbase = os.environ.get("MPM_SOURCE_main_GITBASE")
+        try:
+            os.environ["MPM_SOURCE_main_GITBASE"] = "override-base"
+            with (
+                patch("mpm_cli.repo.repo_init"),
+                patch("mpm_cli.repo.repo_envsubst", side_effect=fake_repo_envsubst),
+                patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync_env),
+            ):
+                install(
+                    mpmenv_path,
+                    lock_file_path=mpmenv_path.parent / ".mpm.lock",
+                )
+        finally:
+            if original_gitbase is None:
+                os.environ.pop("MPM_SOURCE_main_GITBASE", None)
+            else:
+                os.environ["MPM_SOURCE_main_GITBASE"] = original_gitbase
+
+        assert len(envsubst_calls) == 1, f"Expected one repo_envsubst call, got: {len(envsubst_calls)}"
+        called_env = envsubst_calls[0]
+        assert called_env.get("GITBASE") == "override-base", (
+            f"Expected GITBASE=override-base in envsubst call, got: {called_env!r}"
+        )
+
+        clean(mpmenv_path)
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyInstallTwiceThenClean:
+    """AC-TEST-008: install is idempotent -- install twice, verify no duplicates, then clean."""
+
+    def test_full_journey_install_twice_then_clean(self, tmp_path: pathlib.Path) -> None:
+        """Running install twice produces the same final state as running once.
+
+        Steps:
+        1. Create .mpm with one source.
+        2. Run install (first time) -- verify .packages/ created and no store
+           .gitignore under the non-git store.
+        3. Run install (second time) -- verify still no store .gitignore.
+        4. Run clean -- verify .packages/ and .mpm-data/ gone.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            "MPM_SOURCE_build_URL=https://example.com/build.git\n"
+            "MPM_SOURCE_build_REF=main\n"
+            "MPM_SOURCE_build_PATH=default.xml\n"
+            "MPM_SOURCE_build_NAME=build\n"
+            "MPM_SOURCE_build_GITBASE=https://example.com\n",
+            encoding="utf-8",
+        )
+
+        def fake_repo_sync(repo_dir: str, **kwargs) -> None:
+            repo_path = pathlib.Path(repo_dir)
+            _write_empty_manifest(repo_dir)
+            pkg = repo_path / ".packages" / "idempotent-pkg"
+            pkg.mkdir(parents=True, exist_ok=True)
+            (pkg / "script.sh").write_text("#!/bin/sh\necho idempotent\n")
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        assert (store_base / ".packages" / "idempotent-pkg").is_symlink(), (
+            ".packages/idempotent-pkg must be a symlink in the store after first install"
+        )
+        assert not (store_base / ".gitignore").exists(), "install() must not write .gitignore under a non-git store"
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync),
+        ):
+            install(
+                mpmenv_path,
+                lock_file_path=mpmenv_path.parent / ".mpm.lock",
+            )
+
+        assert not (store_base / ".gitignore").exists(), (
+            "a second install must not write .gitignore under a non-git store"
+        )
+        assert (store_base / ".packages" / "idempotent-pkg").is_symlink(), (
+            ".packages/idempotent-pkg must still be a symlink in the store after second install"
+        )
+
+        clean(mpmenv_path)
+
+        assert not (store_base / ".packages").exists(), ".packages/ must be absent from the store after clean"
+        assert not (store_base / ".mpm-data").exists(), ".mpm-data/ must be absent from the store after clean"
+
+
+@pytest.mark.integration
+class TestFullJourneyErrorRecovery:
+    """AC-TEST-009: install fails on second source -> partial state -> clean removes partial state."""
+
+    def test_full_journey_error_recovery(self, tmp_path: pathlib.Path) -> None:
+        """Partial install from failed second source is cleaned up by mpm clean.
+
+        Steps:
+        1. Create .mpm with two sources: 'good' and 'bad'.
+        2. Run install: 'good' syncs OK, 'bad' raises RepoCommandError.
+        3. install() propagates the RepoCommandError.
+        4. Partial state (.mpm-data/sources/good/ or bad/) exists on disk.
+        5. Run clean -- verify .packages/ and .mpm-data/ are removed.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mpmenv_path = project_dir / ".mpm"
+        mpmenv_path.write_text(
+            "MPM_SOURCE_bad_URL=https://invalid.example.com/bad.git\n"
+            "MPM_SOURCE_bad_REF=main\n"
+            "MPM_SOURCE_bad_PATH=default.xml\n"
+            "MPM_SOURCE_bad_NAME=bad\n"
+            "MPM_SOURCE_bad_GITBASE=https://example.com\n"
+            "MPM_SOURCE_good_URL=https://example.com/good.git\n"
+            "MPM_SOURCE_good_REF=main\n"
+            "MPM_SOURCE_good_PATH=default.xml\n"
+            "MPM_SOURCE_good_NAME=good\n"
+            "MPM_SOURCE_good_GITBASE=https://example.com\n",
+            encoding="utf-8",
+        )
+
+        def fake_repo_sync_partial(repo_dir: str, **kwargs) -> None:
+            repo_path = pathlib.Path(repo_dir)
+            source_name = repo_path.name
+            if source_name == "bad":
+                raise RepoCommandError("sync failed: invalid URL")
+            _write_empty_manifest(repo_dir)
+            pkg = repo_path / ".packages" / "good-pkg"
+            pkg.mkdir(parents=True, exist_ok=True)
+            (pkg / "script.sh").write_text("#!/bin/sh\necho good\n")
+
+        with (
+            patch("mpm_cli.repo.repo_init"),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync", side_effect=fake_repo_sync_partial),
+        ):
+            with pytest.raises(RepoCommandError, match="sync failed: invalid URL"):
+                install(
+                    mpmenv_path,
+                    lock_file_path=mpmenv_path.parent / ".mpm.lock",
+                )
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+        partial_exists = (store_base / ".mpm-data" / "sources" / "good").is_dir() or (
+            store_base / ".mpm-data" / "sources" / "bad"
+        ).is_dir()
+        assert partial_exists, "Some partial state (store .mpm-data/sources/) must exist after failed install"
+
+        clean(mpmenv_path)
+
+        assert not (store_base / ".packages").exists(), (
+            ".packages/ must be absent from the store after clean (even after partial install)"
+        )
+        assert not (store_base / ".mpm-data").exists(), (
+            ".mpm-data/ must be absent from the store after clean (even after partial install)"
+        )

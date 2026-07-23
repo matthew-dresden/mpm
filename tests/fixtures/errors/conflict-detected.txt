@@ -1,0 +1,5 @@
+ERROR: Package destination conflict -- two or more sources resolve the same package path to different content.
+  Conflict for package path: .packages/shared-lib
+  source_a (shared-lib): .packages/shared-lib @ aabbccdd1122334455667788990011223344556677889900aabbccdd11223344
+  source_b (shared-lib): .packages/shared-lib @ 1122334455667788990011223344556677889900aabbccdd11223344aabbccdd
+  Remediation: remove one source or align the project revisions so '.packages/shared-lib' resolves to a single content SHA.

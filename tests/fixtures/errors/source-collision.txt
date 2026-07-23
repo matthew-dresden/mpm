@@ -1,0 +1,8 @@
+ERROR: source alias 'example_pkg' is already mapped to https://example.com/org/manifest-repo.git/repo-specs/example-pkg-marketplace.xml (ref refs/tags/v1.0.0); this is a re-add of an existing package.
+-MPM_SOURCE_example_pkg_URL=https://example.com/org/manifest-repo.git
+-MPM_SOURCE_example_pkg_REF=refs/tags/v1.0.0
+-MPM_SOURCE_example_pkg_PATH=repo-specs/example-pkg-marketplace.xml
++MPM_SOURCE_example_pkg_URL=https://example.com/org/manifest-repo.git
++MPM_SOURCE_example_pkg_REF===1.0.0
++MPM_SOURCE_example_pkg_PATH=repo-specs/example-pkg-marketplace.xml
+Use --force to overwrite and re-pin its lock entry, or 'mpm remove example_pkg' first.

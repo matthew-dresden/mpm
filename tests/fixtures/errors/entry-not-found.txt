@@ -1,0 +1,2 @@
+ERROR: Catalog entry 'example-package' not found in the manifest repo.
+Run 'mpm search' to discover available entry names.

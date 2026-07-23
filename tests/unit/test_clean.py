@@ -1,0 +1,647 @@
+"""Tests for clean core business logic."""
+
+import datetime
+import pathlib
+from unittest.mock import patch
+
+import pytest
+
+from mpm_cli.core.clean import (
+    clean,
+    remove_mpm_dir,
+    remove_mpm_home_store,
+    remove_marketplace_dir,
+    remove_packages_dir,
+    remove_project_config,
+)
+from mpm_cli.core.lockfile import (
+    CURRENT_SCHEMA_VERSION,
+    Lockfile,
+    SourceEntry,
+    write_lockfile,
+)
+
+_MINIMAL_MPMENV = (
+    "MPM_SOURCE_build_URL=https://example.com\n"
+    "MPM_SOURCE_build_REF=main\n"
+    "MPM_SOURCE_build_PATH=meta.xml\n"
+    "MPM_SOURCE_build_NAME=build\n"
+    "MPM_SOURCE_build_GITBASE=https://example.com\n"
+)
+
+
+_MINIMAL_MPMENV_MARKETPLACE = _MINIMAL_MPMENV + "MPM_SOURCE_build_MARKETPLACE=true\n"
+
+
+@pytest.mark.unit
+class TestDirectoryRemoval:
+    def test_removes_marketplace(self, tmp_path: pathlib.Path) -> None:
+        mp = tmp_path / "mp"
+        mp.mkdir()
+        (mp / "file.txt").write_text("content")
+        remove_marketplace_dir(mp)
+        assert not mp.exists()
+
+    def test_marketplace_missing_ok(self, tmp_path: pathlib.Path) -> None:
+        remove_marketplace_dir(tmp_path / "nonexistent")
+
+    def test_removes_packages(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / ".packages").mkdir()
+        remove_packages_dir(tmp_path)
+        assert not (tmp_path / ".packages").exists()
+
+    def test_packages_missing_ok(self, tmp_path: pathlib.Path) -> None:
+        remove_packages_dir(tmp_path)
+
+    def test_removes_mpm(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / ".mpm-data").mkdir()
+        remove_mpm_dir(tmp_path)
+        assert not (tmp_path / ".mpm-data").exists()
+
+    def test_mpm_missing_ok(self, tmp_path: pathlib.Path) -> None:
+        remove_mpm_dir(tmp_path)
+
+    def test_removes_store_entries(self, tmp_path: pathlib.Path) -> None:
+        """remove_store_entries prunes content-addressed entries, keeping the store base."""
+        from mpm_cli.core.clean import remove_store_entries
+        from mpm_cli.core.install import store_entries_dir
+
+        store = tmp_path / "store"
+        (store_entries_dir(store) / "deadbeef").mkdir(parents=True)
+        remove_store_entries(store)
+        assert not store_entries_dir(store).exists()
+        assert store.exists(), "the store base directory must survive a prune"
+
+    def test_store_entries_missing_ok(self, tmp_path: pathlib.Path) -> None:
+        """remove_store_entries on an empty store is a no-op (clean before install)."""
+        from mpm_cli.core.clean import remove_store_entries
+
+        store = tmp_path / "store"
+        store.mkdir()
+        remove_store_entries(store)
+        assert store.exists()
+
+
+@pytest.mark.unit
+class TestRemoveProjectConfig:
+    """remove_project_config (mpm clean --purge) deletes .mpm + .mpm.lock; no-op when absent."""
+
+    def test_removes_mpm_and_lock(self, tmp_path: pathlib.Path) -> None:
+        mpmenv = tmp_path / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV)
+        lock = tmp_path / ".mpm.lock"
+        lock.write_text("schema_version = 5\n")
+
+        remove_project_config(mpmenv, lock)
+
+        assert not mpmenv.exists()
+        assert not lock.exists()
+
+    def test_missing_files_ok(self, tmp_path: pathlib.Path) -> None:
+        remove_project_config(tmp_path / ".mpm", tmp_path / ".mpm.lock")
+
+    def test_removes_mpm_when_lock_absent(self, tmp_path: pathlib.Path) -> None:
+        mpmenv = tmp_path / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV)
+
+        remove_project_config(mpmenv, tmp_path / ".mpm.lock")
+
+        assert not mpmenv.exists()
+
+
+@pytest.mark.unit
+class TestRemoveMPMHomeStore:
+    """remove_mpm_home_store (mpm clean --purge-all) removes ONLY mpm-owned folders."""
+
+    def _make_home(self, tmp_path: pathlib.Path) -> pathlib.Path:
+        home = tmp_path / "mpm-home"
+        (home / "store").mkdir(parents=True)
+        (home / "cache").mkdir()
+        return home
+
+    def test_removes_store_cache_and_empty_root(self, tmp_path: pathlib.Path) -> None:
+        home = self._make_home(tmp_path)
+        with patch("mpm_cli.core.clean.resolve_mpm_home", return_value=home):
+            remove_mpm_home_store()
+        assert not home.exists()
+
+    def test_absent_home_is_noop(self, tmp_path: pathlib.Path) -> None:
+        home = tmp_path / "mpm-home"
+        with patch("mpm_cli.core.clean.resolve_mpm_home", return_value=home):
+            remove_mpm_home_store()
+
+    def test_keeps_root_with_non_mpm_content(self, tmp_path: pathlib.Path) -> None:
+        """A non-mpm entry under the home makes purge-all KEEP the root (only store/cache removed)."""
+        home = self._make_home(tmp_path)
+        keep = home / "important.txt"
+        keep.write_text("do not delete")
+
+        with patch("mpm_cli.core.clean.resolve_mpm_home", return_value=home):
+            remove_mpm_home_store()
+
+        assert not (home / "store").exists()
+        assert not (home / "cache").exists()
+        assert home.exists(), "root holding non-mpm content must be kept"
+        assert keep.exists(), "a non-mpm file under MPM_HOME must survive --purge-all"
+
+    @pytest.mark.parametrize("kind", ["home", "root"])
+    def test_refuses_home_and_root(self, kind: str) -> None:
+        """purge-all fails fast (exit 1) and deletes nothing when MPM_HOME is $HOME or /."""
+        target = pathlib.Path.home() if kind == "home" else pathlib.Path(pathlib.Path.cwd().anchor)
+        with patch("mpm_cli.core.clean.resolve_mpm_home", return_value=target):
+            with pytest.raises(SystemExit) as exc_info:
+                remove_mpm_home_store()
+        assert exc_info.value.code == 1
+
+    def test_refuses_ancestor_of_cwd(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """purge-all refuses (deleting nothing) when the cwd is inside the resolved home."""
+        home = self._make_home(tmp_path)
+        deep = home / "a" / "b"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+
+        with patch("mpm_cli.core.clean.resolve_mpm_home", return_value=home):
+            with pytest.raises(SystemExit) as exc_info:
+                remove_mpm_home_store()
+
+        assert exc_info.value.code == 1
+        assert (home / "store").exists(), "must not delete anything when cwd is inside the home"
+
+
+@pytest.mark.unit
+class TestCleanLifecycle:
+    def test_marketplace_false_skips_uninstall(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = tmp_path / "home" / "store"
+        monkeypatch.setenv("MPM_HOME", str(tmp_path / "home"))
+        mpmenv = tmp_path / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV)
+        (store / ".packages").mkdir(parents=True)
+        (store / ".mpm-data").mkdir(parents=True, exist_ok=True)
+        with patch("mpm_cli.core.clean.uninstall_marketplace_plugins") as mock_uninstall:
+            clean(mpmenv)
+            mock_uninstall.assert_not_called()
+        assert not (store / ".packages").exists()
+
+    def test_marketplace_true_missing_dir_exits(self, tmp_path: pathlib.Path) -> None:
+        mpmenv = tmp_path / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV_MARKETPLACE)
+        with pytest.raises(SystemExit):
+            clean(mpmenv)
+
+    def test_order_of_operations(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        mp_dir = tmp_path / ".marketplaces"
+        store = tmp_path / "home" / "store"
+        monkeypatch.setenv("MPM_HOME", str(tmp_path / "home"))
+        mpmenv = tmp_path / ".mpm"
+        mpmenv.write_text(f"CLAUDE_MARKETPLACES_DIR={mp_dir}\n" + _MINIMAL_MPMENV_MARKETPLACE)
+        mp_dir.mkdir()
+        (store / ".packages").mkdir(parents=True)
+        (store / ".mpm-data").mkdir(parents=True, exist_ok=True)
+
+        ops: list[str] = []
+
+        def track_uninstall(marketplace_dir):
+            ops.append("uninstall")
+
+        orig_rmtree = __import__("shutil").rmtree
+
+        def track_rm(path, ignore_errors=False):
+            p = str(path)
+            if ".marketplaces" in p:
+                ops.append("rm_mp")
+            elif ".packages" in p:
+                ops.append("rm_packages")
+            elif ".mpm-data" in p:
+                ops.append("rm_mpm")
+            orig_rmtree(path, ignore_errors=ignore_errors)
+
+        with (
+            patch("mpm_cli.core.clean.uninstall_marketplace_plugins", side_effect=track_uninstall),
+            patch("mpm_cli.core.clean.shutil.rmtree", side_effect=track_rm),
+        ):
+            clean(mpmenv)
+
+        assert ops == ["uninstall", "rm_mp", "rm_packages", "rm_mpm"]
+
+
+@pytest.mark.unit
+class TestCleanSymlinkResolution:
+    """Verify clean() resolves .mpm symlinks and removes artifacts from the MPM_HOME store.
+
+    Under the shared MPM_HOME store model the fetched artifacts (.packages/,
+    .mpm-data/) live under <MPM_HOME>/store, not beside .mpm. clean() must
+    still resolve a symlinked .mpm (so the committed .mpm.lock is read from the
+    real project directory) and must remove the store artifacts. Directories that
+    merely sit beside the .mpm symlink must never be touched.
+    """
+
+    def test_clean_resolves_symlink_and_removes_store_artifacts(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """clean() resolves the .mpm symlink and removes .packages/ + .mpm-data/ from the store.
+
+        Layout:
+          tmp_path/
+            home/store/
+              .packages/       <- must be removed by clean()
+              .mpm-data/     <- must be removed by clean()
+            real_project/
+              .mpm           <- the real .mpm file
+            symlink_dir/
+              .mpm -> ../real_project/.mpm   <- symlink passed to clean()
+              .packages/       <- must NOT be touched by clean()
+        """
+        store = tmp_path / "home" / "store"
+        monkeypatch.setenv("MPM_HOME", str(tmp_path / "home"))
+
+        real_project = tmp_path / "real_project"
+        real_project.mkdir()
+        symlink_dir = tmp_path / "symlink_dir"
+        symlink_dir.mkdir()
+
+        real_mpmenv = real_project / ".mpm"
+        real_mpmenv.write_text("MPM_MARKETPLACE_INSTALL=false\n" + _MINIMAL_MPMENV)
+
+        symlink_mpmenv = symlink_dir / ".mpm"
+        symlink_mpmenv.symlink_to(real_mpmenv)
+
+        (store / ".packages").mkdir(parents=True)
+        (store / ".mpm-data").mkdir(parents=True)
+        (symlink_dir / ".packages").mkdir()
+
+        assert symlink_mpmenv.is_symlink(), "setup: .mpm in symlink_dir must be a symlink"
+        assert symlink_mpmenv.resolve() == real_mpmenv, "setup: symlink must point to real .mpm"
+        assert (store / ".packages").exists(), "setup: store/.packages must exist before clean()"
+        assert (symlink_dir / ".packages").exists(), "setup: symlink_dir/.packages must exist before clean()"
+
+        clean(symlink_mpmenv)
+
+        assert not (store / ".packages").exists(), ".packages/ must be removed from the MPM_HOME store"
+        assert not (store / ".mpm-data").exists(), ".mpm-data/ must be removed from the MPM_HOME store"
+        assert (symlink_dir / ".packages").exists(), ".packages/ beside the .mpm symlink must NOT be removed by clean()"
+
+
+@pytest.mark.unit
+class TestCleanSubparserHelp:
+    """The 'clean' subparser has add_help=True and accepts '-h'."""
+
+    def test_clean_short_dash_h_exits_0(self) -> None:
+        """mpm clean -h exits 0 (add_help=True on the clean subparser)."""
+
+        from mpm_cli.cli import main
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["clean", "-h"])
+        assert exc_info.value.code == 0
+
+    def test_clean_subparser_has_add_help_true(self) -> None:
+        """The 'clean' subparser has add_help=True set explicitly."""
+        import argparse
+
+        from mpm_cli.commands.clean import register
+
+        root_parser = argparse.ArgumentParser()
+        subparsers = root_parser.add_subparsers(dest="command")
+        register(subparsers)
+        clean_parser = subparsers.choices["clean"]
+        assert clean_parser.add_help is True, "clean subparser must have add_help=True so '-h' is accepted"
+
+
+@pytest.mark.unit
+class TestCleanMPMHomeStore:
+    """clean() removes .packages/ and .mpm-data/ from the <MPM_HOME>/store."""
+
+    def test_clean_removes_dirs_from_mpm_home_store(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-23: clean removes .packages/ and .mpm-data/ from <MPM_HOME>/store, never from cwd."""
+        mpm_home = tmp_path / "home"
+        store = mpm_home / "store"
+        cwd_dir = tmp_path / "project"
+        cwd_dir.mkdir()
+
+        mpmenv = cwd_dir / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV)
+
+        (store / ".packages").mkdir(parents=True)
+        (store / ".mpm-data").mkdir(parents=True)
+
+        (cwd_dir / ".packages").mkdir()
+        (cwd_dir / ".mpm-data").mkdir()
+
+        monkeypatch.setenv("MPM_HOME", str(mpm_home))
+
+        with patch("mpm_cli.core.clean.uninstall_marketplace_plugins"):
+            clean(mpmenv)
+
+        assert not (store / ".packages").exists(), ".packages/ must be removed from the MPM_HOME store"
+        assert not (store / ".mpm-data").exists(), ".mpm-data/ must be removed from the MPM_HOME store"
+
+        assert (cwd_dir / ".packages").exists(), ".packages/ in cwd must NOT be touched by clean"
+        assert (cwd_dir / ".mpm-data").exists(), ".mpm-data/ in cwd must NOT be touched by clean"
+
+    def test_clean_default_home_resolves_to_home_mpm_store(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With MPM_HOME unset, clean resolves the store under $HOME/.mpm-home/store (env-derived).
+
+        The clean removal targets the resolved store; this test points $HOME at a
+        temp dir so the default ~/.mpm-home/store resolves inside the sandbox and no
+        real home directory is touched.
+        """
+        import os
+
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+        store = fake_home / ".mpm-home" / "store"
+        monkeypatch.delenv("MPM_HOME", raising=False)
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        os.environ.pop("MPM_HOME", None)
+
+        cwd_dir = tmp_path / "project"
+        cwd_dir.mkdir()
+        mpmenv = cwd_dir / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV)
+
+        (store / ".packages").mkdir(parents=True)
+        (store / ".mpm-data").mkdir(parents=True)
+
+        with patch("mpm_cli.core.clean.uninstall_marketplace_plugins"):
+            clean(mpmenv)
+
+        assert not (store / ".packages").exists(), (
+            "Without MPM_HOME, .packages/ must be removed from $HOME/.mpm-home/store"
+        )
+        assert not (store / ".mpm-data").exists(), (
+            "Without MPM_HOME, .mpm-data/ must be removed from $HOME/.mpm-home/store"
+        )
+
+    def test_clean_prunes_content_addressed_store_entries(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-52: clean prunes the content-addressed store entries in addition to per-project artifacts."""
+        from mpm_cli.core.install import store_entries_dir
+
+        mpm_home = tmp_path / "home"
+        store = mpm_home / "store"
+        cwd_dir = tmp_path / "project"
+        cwd_dir.mkdir()
+
+        mpmenv = cwd_dir / ".mpm"
+        mpmenv.write_text(_MINIMAL_MPMENV)
+
+        entry = store_entries_dir(store) / ("a" * 64)
+        entry.mkdir(parents=True)
+        (entry / "payload").write_text("data")
+        (store / ".packages").mkdir(parents=True)
+        (store / ".mpm-data").mkdir(parents=True)
+
+        monkeypatch.setenv("MPM_HOME", str(mpm_home))
+
+        with patch("mpm_cli.core.clean.uninstall_marketplace_plugins"):
+            clean(mpmenv)
+
+        assert not entry.exists(), "the content-addressed store entry must be pruned by clean"
+        assert not store_entries_dir(store).exists(), "the store entries directory must be pruned by clean"
+        assert store.exists(), "the store base directory must survive clean"
+
+
+def _make_source(name: str, *, registered_marketplaces: list[str]) -> SourceEntry:
+    """Build a valid SourceEntry carrying a per-source marketplace ledger."""
+    return SourceEntry(
+        alias=name,
+        name=name,
+        url=f"https://example.com/{name}.git",
+        ref_spec="main",
+        resolved_ref="refs/heads/main",
+        resolved_sha="a" * 40,
+        path=f"repo-specs/{name}.xml",
+        registered_marketplaces=registered_marketplaces,
+    )
+
+
+def _write_lock(
+    base_dir: pathlib.Path,
+    *,
+    marketplace_dir: pathlib.Path,
+    sources: list[SourceEntry],
+) -> pathlib.Path:
+    """Write a real schema-v4 .mpm.lock with per-source marketplace ledgers.
+
+    Schema v4 carries no [catalog] block; the hash is synthetic-but-valid so
+    read_lockfile parses the file without raising. Returns the lockfile path.
+    """
+    lockfile = Lockfile(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        generated_at=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        generator="mpm-cli/test",
+        mpm_hash="sha256:" + ("a" * 64),
+        sources=sources,
+        marketplace_registered=True,
+        marketplace_dir=str(marketplace_dir),
+    )
+    lock_path = base_dir / ".mpm.lock"
+    write_lockfile(lockfile, lock_path)
+    return lock_path
+
+
+def _write_mpm_sources(directory: pathlib.Path, marketplace_dir: pathlib.Path, source_names: list[str]) -> pathlib.Path:
+    """Write a .mpm declaring the given source names (marketplace install on).
+
+    Each source opts into marketplace install via its per-dependency
+    MPM_SOURCE_<name>_MARKETPLACE=true flag (spec Section 5.1 / FR-17).
+    """
+    lines = [
+        f"CLAUDE_MARKETPLACES_DIR={marketplace_dir}",
+    ]
+    for name in source_names:
+        lines.append(f"MPM_SOURCE_{name}_URL=https://example.com/{name}.git")
+        lines.append(f"MPM_SOURCE_{name}_REF=main")
+        lines.append(f"MPM_SOURCE_{name}_PATH=repo-specs/{name}.xml")
+        lines.append(f"MPM_SOURCE_{name}_NAME={name}")
+        lines.append(f"MPM_SOURCE_{name}_GITBASE=https://example.com")
+        lines.append(f"MPM_SOURCE_{name}_MARKETPLACE=true")
+    mpmenv = directory / ".mpm"
+    mpmenv.write_text("\n".join(lines) + "\n")
+    return mpmenv
+
+
+_KEEP_SET_NAMES = ("claude-plugins-official", "devbench-authoring")
+
+
+@pytest.mark.unit
+class TestCleanOrphansSourcePrune:
+    """``clean(orphans=True)`` unregisters marketplaces of sources removed from .mpm.
+
+    SAFETY INVARIANT: removal candidates come ONLY from the per-source
+    ``registered_marketplaces`` ledgers of sources in the lock but absent from
+    the current .mpm. A marketplace still provided by a referenced source, and
+    user/keep-set names never written to any ledger, must never be passed to
+    ``remove_marketplace``.
+    """
+
+    def test_orphaned_source_marketplace_is_pruned_keepset_and_referenced_untouched(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Lock has A+B; .mpm has only B -> prune A's marketplace, keep B's; keep-set untouched.
+
+        Source A (removed from .mpm) registered ``alpha-mp``; source B (still
+        in .mpm) registered ``bravo-mp``. Only ``alpha-mp`` must be removed; B's
+        marketplace and any keep-set name must never be removed.
+        """
+        marketplace_dir = tmp_path / "marketplaces"
+        marketplace_dir.mkdir()
+
+        mpmenv = _write_mpm_sources(tmp_path, marketplace_dir, ["bravo"])
+        (tmp_path / ".packages").mkdir()
+
+        _write_lock(
+            tmp_path,
+            marketplace_dir=marketplace_dir,
+            sources=[
+                _make_source("alpha", registered_marketplaces=["alpha-mp"]),
+                _make_source("bravo", registered_marketplaces=["bravo-mp"]),
+            ],
+        )
+
+        removed: list[str] = []
+
+        def _track_remove(claude_bin, name):
+            removed.append(name)
+            return True
+
+        with (
+            patch("mpm_cli.core.clean.locate_claude_binary", return_value="/usr/bin/claude") as mock_locate,
+            patch("mpm_cli.core.clean.remove_marketplace", side_effect=_track_remove),
+            patch("mpm_cli.core.clean.uninstall_marketplace_plugins"),
+        ):
+            clean(mpmenv, orphans=True)
+
+        assert removed == ["alpha-mp"], (
+            f"Only orphaned source A's marketplace 'alpha-mp' must be removed; got {removed!r}"
+        )
+        assert "bravo-mp" not in removed, "A still-referenced source's marketplace must not be removed"
+        for keep in _KEEP_SET_NAMES:
+            assert keep not in removed, (
+                f"Keep-set marketplace {keep!r} was never in any ledger and must never be removed; got {removed!r}"
+            )
+        mock_locate.assert_called_once()
+
+    def test_marketplace_shared_by_referenced_source_is_not_pruned(self, tmp_path: pathlib.Path) -> None:
+        """A marketplace registered by BOTH an orphaned and a referenced source is retained.
+
+        Source A (removed) and source B (kept) both registered ``shared-mp``; A
+        also registered ``alpha-only-mp``. Only ``alpha-only-mp`` is pruned --
+        ``shared-mp`` stays because B still references it.
+        """
+        marketplace_dir = tmp_path / "marketplaces"
+        marketplace_dir.mkdir()
+
+        mpmenv = _write_mpm_sources(tmp_path, marketplace_dir, ["bravo"])
+        (tmp_path / ".packages").mkdir()
+
+        _write_lock(
+            tmp_path,
+            marketplace_dir=marketplace_dir,
+            sources=[
+                _make_source("alpha", registered_marketplaces=["alpha-only-mp", "shared-mp"]),
+                _make_source("bravo", registered_marketplaces=["shared-mp"]),
+            ],
+        )
+
+        removed: list[str] = []
+
+        with (
+            patch("mpm_cli.core.clean.locate_claude_binary", return_value="/usr/bin/claude"),
+            patch("mpm_cli.core.clean.remove_marketplace", side_effect=lambda claude_bin, name: removed.append(name)),
+            patch("mpm_cli.core.clean.uninstall_marketplace_plugins"),
+        ):
+            clean(mpmenv, orphans=True)
+
+        assert removed == ["alpha-only-mp"], (
+            f"Only A's exclusive marketplace must be pruned; 'shared-mp' is still referenced by B; got {removed!r}"
+        )
+
+    def test_no_orphaned_sources_does_not_locate_claude_or_remove(self, tmp_path: pathlib.Path) -> None:
+        """When every lock source is still in .mpm, no removal and no claude lookup."""
+        marketplace_dir = tmp_path / "marketplaces"
+        marketplace_dir.mkdir()
+
+        mpmenv = _write_mpm_sources(tmp_path, marketplace_dir, ["bravo"])
+        (tmp_path / ".packages").mkdir()
+
+        _write_lock(
+            tmp_path,
+            marketplace_dir=marketplace_dir,
+            sources=[_make_source("bravo", registered_marketplaces=["bravo-mp"])],
+        )
+
+        with (
+            patch("mpm_cli.core.clean.locate_claude_binary") as mock_locate,
+            patch("mpm_cli.core.clean.remove_marketplace") as mock_remove,
+            patch("mpm_cli.core.clean.uninstall_marketplace_plugins"),
+        ):
+            clean(mpmenv, orphans=True)
+
+        mock_remove.assert_not_called()
+        mock_locate.assert_not_called()
+
+    def test_orphans_false_never_calls_remove_marketplace(self, tmp_path: pathlib.Path) -> None:
+        """Regression: the default (orphans=False) path never touches remove_marketplace.
+
+        Even with an orphaned source in the lock, the plain clean path must not
+        unregister anything -- the prune is opt-in via --orphans.
+        """
+        marketplace_dir = tmp_path / "marketplaces"
+        marketplace_dir.mkdir()
+
+        mpmenv = _write_mpm_sources(tmp_path, marketplace_dir, ["bravo"])
+        (tmp_path / ".packages").mkdir()
+
+        _write_lock(
+            tmp_path,
+            marketplace_dir=marketplace_dir,
+            sources=[
+                _make_source("alpha", registered_marketplaces=["alpha-mp"]),
+                _make_source("bravo", registered_marketplaces=["bravo-mp"]),
+            ],
+        )
+
+        with (
+            patch("mpm_cli.core.clean.remove_marketplace") as mock_remove,
+            patch("mpm_cli.core.clean.locate_claude_binary") as mock_locate,
+            patch("mpm_cli.core.clean.uninstall_marketplace_plugins"),
+        ):
+            clean(mpmenv, orphans=False)
+
+        mock_remove.assert_not_called()
+        mock_locate.assert_not_called()
+
+    def test_orphaned_source_with_empty_ledger_skips_prune(self, tmp_path: pathlib.Path) -> None:
+        """An orphaned source that registered no marketplaces yields nothing to prune."""
+        marketplace_dir = tmp_path / "marketplaces"
+        marketplace_dir.mkdir()
+
+        mpmenv = _write_mpm_sources(tmp_path, marketplace_dir, ["bravo"])
+        (tmp_path / ".packages").mkdir()
+
+        _write_lock(
+            tmp_path,
+            marketplace_dir=marketplace_dir,
+            sources=[
+                _make_source("alpha", registered_marketplaces=[]),
+                _make_source("bravo", registered_marketplaces=["bravo-mp"]),
+            ],
+        )
+
+        with (
+            patch("mpm_cli.core.clean.remove_marketplace") as mock_remove,
+            patch("mpm_cli.core.clean.locate_claude_binary") as mock_locate,
+            patch("mpm_cli.core.clean.uninstall_marketplace_plugins"),
+        ):
+            clean(mpmenv, orphans=True)
+
+        mock_remove.assert_not_called()
+        mock_locate.assert_not_called()

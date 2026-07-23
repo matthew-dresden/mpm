@@ -1,0 +1,691 @@
+"""Integration tests for 'mpm doctor' consistency subchecks 1-5.
+
+Drives the full CLI via subprocess against real fixture git repos.
+Covers:
+- Absent .mpm: exit non-zero with ERROR shape message
+- Absent .mpm.lock: exit 0 with info-level notice
+- Hash mismatch: exit non-zero with ERROR: mpm_hash mismatch
+- Orphan lock entry: exit non-zero with ERROR: orphan lock entry
+- Branch drift (without --strict-drift): exit 0 with info-level notice
+- Branch drift (with --strict-drift): exit non-zero with error
+- Dangling SHA: exit non-zero with ERROR: dangling SHA
+
+AC-TEST-002, AC-CYCLE-001
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import subprocess
+import sys
+import pytest
+
+from tests.conftest import (
+    write_mpm_doctor_integration as _write_mpm,
+    write_lockfile_doctor_integration as _write_lockfile,
+    write_lockfile_doctor_integration_multi_source as _write_lockfile_two_sources,
+)
+
+
+_GIT_USER_NAME = "Test User"
+_GIT_USER_EMAIL = "test@example.com"
+
+
+def _git(args: list[str], cwd: pathlib.Path) -> None:
+    """Run a git command in cwd, raising RuntimeError on non-zero exit."""
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {args!r} failed in {cwd!r}:\n  stdout: {result.stdout!r}\n  stderr: {result.stderr!r}")
+
+
+def _git_output(args: list[str], cwd: pathlib.Path) -> str:
+    """Run a git command in cwd and return stdout, raising RuntimeError on failure."""
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {args!r} failed in {cwd!r}:\n  stdout: {result.stdout!r}\n  stderr: {result.stderr!r}")
+    return result.stdout.strip()
+
+
+def _init_git_work_dir(work_dir: pathlib.Path) -> None:
+    """Initialise a git working directory with test user config."""
+    _git(["init", "-b", "main"], cwd=work_dir)
+    _git(["config", "user.name", _GIT_USER_NAME], cwd=work_dir)
+    _git(["config", "user.email", _GIT_USER_EMAIL], cwd=work_dir)
+
+
+def _clone_as_bare(work_dir: pathlib.Path, bare_dir: pathlib.Path) -> pathlib.Path:
+    """Clone work_dir into a bare repository and return the bare path."""
+    _git(["clone", "--bare", str(work_dir), str(bare_dir)], cwd=work_dir.parent)
+    return bare_dir.resolve()
+
+
+def _create_bare_repo_with_two_commits(
+    base: pathlib.Path,
+    name: str,
+) -> tuple[pathlib.Path, str, str]:
+    """Create a bare repo with two commits on main.
+
+    Returns (bare_path, sha_a, sha_b) where sha_a is the older commit
+    and sha_b is HEAD.
+
+    Args:
+        base: Parent directory for work and bare repos.
+        name: Used for directory naming.
+
+    Returns:
+        Tuple of (bare_path, sha_a, sha_b).
+    """
+    work_dir = base / f"{name}-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _init_git_work_dir(work_dir)
+
+    (work_dir / "README.md").write_text(f"# {name} initial\n")
+    _git(["add", "."], cwd=work_dir)
+    _git(["commit", "-m", "Initial commit"], cwd=work_dir)
+    sha_a = _git_output(["rev-parse", "HEAD"], cwd=work_dir)
+
+    (work_dir / "README.md").write_text(f"# {name} second\n")
+    _git(["add", "."], cwd=work_dir)
+    _git(["commit", "-m", "Second commit"], cwd=work_dir)
+    sha_b = _git_output(["rev-parse", "HEAD"], cwd=work_dir)
+
+    bare_dir = _clone_as_bare(work_dir, base / f"{name}-bare.git")
+    return bare_dir.resolve(), sha_a, sha_b
+
+
+def _run_mpm(
+    args: list[str],
+    cwd: pathlib.Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the mpm CLI via the same Python interpreter."""
+    env = dict(os.environ)
+    env.pop("MPM_CATALOG_SOURCES", None)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-m", "mpm_cli"] + args,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(cwd) if cwd else None,
+    )
+
+
+@pytest.mark.integration
+class TestDoctorAbsentMPMFile:
+    """mpm doctor exits non-zero with ERROR message when .mpm is absent (AC-FUNC-001)."""
+
+    def test_no_mpm_file_exits_nonzero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits non-zero when .mpm file is absent."""
+        result = _run_mpm(["doctor", "--mpm-file", str(tmp_path / ".mpm")], cwd=tmp_path)
+
+        assert result.returncode != 0
+
+    def test_no_mpm_file_stderr_contains_error_shape(self, tmp_path: pathlib.Path) -> None:
+        """doctor prints ERROR-shape message to stderr when .mpm is absent."""
+        result = _run_mpm(["doctor", "--mpm-file", str(tmp_path / ".mpm")], cwd=tmp_path)
+
+        assert "ERROR:" in result.stderr
+
+    def test_no_mpm_file_stderr_mentions_not_found(self, tmp_path: pathlib.Path) -> None:
+        """doctor stderr mentions '.mpm' not found when .mpm is absent."""
+        result = _run_mpm(["doctor", "--mpm-file", str(tmp_path / ".mpm")], cwd=tmp_path)
+
+        assert "not found" in result.stderr or "no mpm workspace" in result.stderr
+
+
+@pytest.mark.integration
+class TestDoctorAbsentLockfile:
+    """mpm doctor exits 0 with info notice when .mpm exists but .mpm.lock is absent (AC-FUNC-002)."""
+
+    def test_no_lockfile_exits_zero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits 0 when .mpm.lock is absent."""
+        mpm_file = _write_mpm(tmp_path, "src", "https://example.com/org/repo.git")
+
+        result = _run_mpm(["doctor", "--mpm-file", str(mpm_file)], cwd=tmp_path)
+
+        assert result.returncode == 0
+
+    def test_no_lockfile_stderr_contains_info_notice(self, tmp_path: pathlib.Path) -> None:
+        """doctor prints info-level notice to stderr when lockfile absent."""
+        mpm_file = _write_mpm(tmp_path, "src", "https://example.com/org/repo.git")
+
+        result = _run_mpm(["doctor", "--mpm-file", str(mpm_file)], cwd=tmp_path)
+
+        assert "No lockfile present" in result.stderr
+
+
+@pytest.mark.integration
+class TestDoctorHashMismatch:
+    """mpm doctor exits non-zero with ERROR: mpm_hash mismatch when hash is wrong (AC-FUNC-003)."""
+
+    def test_hash_mismatch_exits_nonzero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits non-zero when mpm_hash in lockfile is wrong."""
+        url = "https://example.com/org/repo.git"
+        mpm_file = _write_mpm(tmp_path, "src", url)
+
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val="sha256:" + "b" * 64,
+            source_name="src",
+            url=url,
+            revision_spec="main",
+            resolved_sha="a" * 40,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode != 0
+
+    def test_hash_mismatch_stderr_contains_error_message(self, tmp_path: pathlib.Path) -> None:
+        """doctor stderr contains ERROR: mpm_hash mismatch when hash is wrong."""
+        url = "https://example.com/org/repo.git"
+        mpm_file = _write_mpm(tmp_path, "src", url)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val="sha256:" + "b" * 64,
+            source_name="src",
+            url=url,
+            revision_spec="main",
+            resolved_sha="a" * 40,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert "mpm_hash mismatch" in result.stderr
+
+    def test_hash_mismatch_stderr_mentions_refresh_lock(self, tmp_path: pathlib.Path) -> None:
+        """doctor stderr mentions mpm install --refresh-lock as remediation."""
+        url = "https://example.com/org/repo.git"
+        mpm_file = _write_mpm(tmp_path, "src", url)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val="sha256:" + "b" * 64,
+            source_name="src",
+            url=url,
+            revision_spec="main",
+            resolved_sha="a" * 40,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert "--refresh-lock" in result.stderr
+
+
+@pytest.mark.integration
+class TestDoctorOrphanLock:
+    """mpm doctor exits non-zero with ERROR: orphan lock entry when source is orphaned (AC-FUNC-004)."""
+
+    def test_orphan_lock_exits_nonzero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits non-zero when lockfile has a source not in .mpm."""
+        url = "https://example.com/org/repo.git"
+        mpm_file = _write_mpm(tmp_path, "src", url)
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+
+        _write_lockfile_two_sources(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            sources=[
+                {"name": "src", "url": url, "revision_spec": "main", "resolved_sha": "a" * 40},
+                {
+                    "name": "ghost",
+                    "url": "https://example.com/other.git",
+                    "revision_spec": "main",
+                    "resolved_sha": "b" * 40,
+                },
+            ],
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode != 0
+
+    def test_orphan_lock_stderr_contains_error_message(self, tmp_path: pathlib.Path) -> None:
+        """doctor stderr contains ERROR: orphan lock entry."""
+        url = "https://example.com/org/repo.git"
+        mpm_file = _write_mpm(tmp_path, "src", url)
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        _write_lockfile_two_sources(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            sources=[
+                {"name": "src", "url": url, "revision_spec": "main", "resolved_sha": "a" * 40},
+                {
+                    "name": "ghost",
+                    "url": "https://example.com/other.git",
+                    "revision_spec": "main",
+                    "resolved_sha": "b" * 40,
+                },
+            ],
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert "orphan lock entry" in result.stderr
+        assert "ghost" in result.stderr
+
+
+@pytest.mark.integration
+class TestDoctorBranchDrift:
+    """mpm doctor handles branch drift correctly (AC-FUNC-005)."""
+
+    def test_drift_without_strict_exits_zero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits 0 (info-level) when branch has drifted but --strict-drift is not set."""
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "proj")
+        url = f"file://{bare_path}"
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision="main")
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec="main",
+            resolved_sha=sha_a,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode == 0
+
+    def test_drift_without_strict_stderr_contains_drift_notice(self, tmp_path: pathlib.Path) -> None:
+        """doctor prints drift notice to stderr when branch has drifted (no --strict-drift)."""
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "proj")
+        url = f"file://{bare_path}"
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision="main")
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec="main",
+            resolved_sha=sha_a,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert "drift" in result.stderr.lower() or "BRANCH_DRIFT" in result.stderr
+
+    def test_drift_with_strict_exits_nonzero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits non-zero when branch has drifted and --strict-drift is set."""
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "proj")
+        url = f"file://{bare_path}"
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision="main")
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec="main",
+            resolved_sha=sha_a,
+        )
+
+        result = _run_mpm(
+            [
+                "doctor",
+                "--mpm-file",
+                str(mpm_file),
+                "--lock-file",
+                str(tmp_path / ".mpm.lock"),
+                "--strict-drift",
+            ],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode != 0
+
+
+@pytest.mark.integration
+class TestDoctorDanglingSha:
+    """mpm doctor exits non-zero with ERROR: dangling SHA when SHA is unreachable (AC-FUNC-006)."""
+
+    def test_reachable_sha_exits_zero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits 0 when a SHA-pinned source's locked SHA is still reachable.
+
+        Uses a SHA-pinned source (revision_spec is the commit SHA) so that the
+        dangling SHA check runs (branch-pinned sources skip it). The SHA is
+        sha_b, the current HEAD -- it is still reachable via ls-remote.
+        """
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "proj")
+        url = f"file://{bare_path}"
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision=sha_b)
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec=sha_b,
+            resolved_sha=sha_b,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode == 0
+
+    def test_dangling_sha_exits_nonzero(self, tmp_path: pathlib.Path) -> None:
+        """doctor exits non-zero when a SHA-pinned source's SHA is not reachable.
+
+        Uses a SHA-pinned source (revision_spec is a 40-char hex SHA) because
+        the dangling SHA check skips branch-pinned sources (those are covered
+        by the branch drift check instead).
+        """
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "proj")
+        url = f"file://{bare_path}"
+
+        fake_sha = "d" * 40
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision=fake_sha)
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec=fake_sha,
+            resolved_sha=fake_sha,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode != 0
+
+    def test_dangling_sha_stderr_contains_error_message(self, tmp_path: pathlib.Path) -> None:
+        """doctor stderr contains ERROR: dangling SHA when SHA-pinned source's SHA is unreachable."""
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "proj")
+        url = f"file://{bare_path}"
+        fake_sha = "d" * 40
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision=fake_sha)
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec=fake_sha,
+            resolved_sha=fake_sha,
+        )
+
+        result = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(tmp_path / ".mpm.lock")],
+            cwd=tmp_path,
+        )
+
+        assert "dangling SHA" in result.stderr or "dangling" in result.stderr.lower()
+        assert fake_sha in result.stderr
+
+
+def _write_mpm_two_branch_sources(
+    directory: pathlib.Path,
+    sources: list[tuple[str, str]],
+) -> pathlib.Path:
+    """Write a multi-source .mpm with each source branch-pinned to 'main'.
+
+    Args:
+        directory: Directory in which to write the .mpm file.
+        sources: List of (alias, url) tuples; each gets a branch-pinned block
+            whose MPM_SOURCE_<alias>_REF is 'main' so the doctor branch-drift
+            subcheck applies to it.
+
+    Returns:
+        Path to the written .mpm file.
+    """
+    lines: list[str] = []
+    for alias, url in sources:
+        lines.append(f"MPM_SOURCE_{alias}_URL={url}")
+        lines.append(f"MPM_SOURCE_{alias}_REF=main")
+        lines.append(f"MPM_SOURCE_{alias}_PATH=repo-specs/meta.xml")
+        lines.append(f"MPM_SOURCE_{alias}_NAME={alias}")
+        lines.append(f"MPM_SOURCE_{alias}_GITBASE=https://example.com/org")
+    lines.append("MPM_MARKETPLACE_INSTALL=false")
+    mpm_file = directory / ".mpm"
+    mpm_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mpm_file.chmod(0o644)
+    return mpm_file
+
+
+@pytest.mark.integration
+class TestDoctorStrictDriftListsEveryDriftedSource:
+    """--strict-drift error lists EVERY drifted branch-pinned source (not just one).
+
+    Builds two distinct branch-pinned sources whose locked SHA is the older
+    commit (sha_a) while each branch tip is at the newer commit (sha_b), so
+    BOTH sources have drifted. Under --strict-drift the doctor must surface one
+    error finding per drifted source -- the existing strict-drift integration
+    test only drifts a single source.
+    """
+
+    def _build_two_drifted_sources(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> tuple[pathlib.Path, pathlib.Path, dict[str, tuple[str, str]]]:
+        """Create two branch-pinned sources, both drifted, and write the workspace.
+
+        Each source repo has two commits on main; the lockfile pins the OLDER
+        commit (sha_a) while the branch tip is the NEWER commit (sha_b), so each
+        source is in a drifted state.
+
+        Args:
+            tmp_path: Per-test temp directory.
+
+        Returns:
+            A tuple (mpm_file, lock_file, details) where details maps each
+            alias to its (locked_sha, tip_sha) pair.
+        """
+        bare_alpha, alpha_a, alpha_b = _create_bare_repo_with_two_commits(tmp_path, "alpha")
+        bare_beta, beta_a, beta_b = _create_bare_repo_with_two_commits(tmp_path, "beta")
+
+        url_alpha = f"file://{bare_alpha}"
+        url_beta = f"file://{bare_beta}"
+
+        mpm_file = _write_mpm_two_branch_sources(
+            tmp_path,
+            [("alpha", url_alpha), ("beta", url_beta)],
+        )
+
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+
+        _write_lockfile_two_sources(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            sources=[
+                {"name": "alpha", "url": url_alpha, "revision_spec": "main", "resolved_sha": alpha_a},
+                {"name": "beta", "url": url_beta, "revision_spec": "main", "resolved_sha": beta_a},
+            ],
+        )
+
+        details = {
+            "alpha": (alpha_a, alpha_b),
+            "beta": (beta_a, beta_b),
+        }
+        return mpm_file, tmp_path / ".mpm.lock", details
+
+    def test_strict_drift_exits_nonzero_with_two_drifted_sources(self, tmp_path: pathlib.Path) -> None:
+        """doctor --strict-drift exits non-zero when two branch sources have drifted."""
+        mpm_file, lock_file, _details = self._build_two_drifted_sources(tmp_path)
+
+        result = _run_mpm(
+            [
+                "doctor",
+                "--mpm-file",
+                str(mpm_file),
+                "--lock-file",
+                str(lock_file),
+                "--strict-drift",
+            ],
+            cwd=tmp_path,
+        )
+
+        assert result.returncode != 0, f"Expected non-zero exit. stderr: {result.stderr!r}"
+
+    def test_strict_drift_error_names_every_drifted_source(self, tmp_path: pathlib.Path) -> None:
+        """doctor --strict-drift surfaces an ERROR branch-drift finding for EACH drifted source.
+
+        Both source aliases ('alpha' and 'beta') and both current tip SHAs
+        (truncated to 12 chars, the doctor's render width) must appear as
+        ERROR-level branch-drift findings on stderr -- the error lists every
+        drifted source, not just the first one encountered.
+        """
+        mpm_file, lock_file, details = self._build_two_drifted_sources(tmp_path)
+
+        result = _run_mpm(
+            [
+                "doctor",
+                "--mpm-file",
+                str(mpm_file),
+                "--lock-file",
+                str(lock_file),
+                "--strict-drift",
+            ],
+            cwd=tmp_path,
+        )
+
+        error_drift_lines = [
+            line for line in result.stderr.splitlines() if line.startswith("ERROR:") and "branch drift" in line
+        ]
+        assert len(error_drift_lines) == 2, (
+            f"Expected exactly 2 ERROR branch-drift findings (one per drifted source); "
+            f"got {len(error_drift_lines)}.\nstderr: {result.stderr!r}"
+        )
+
+        joined = "\n".join(error_drift_lines)
+        for alias, (_locked_sha, tip_sha) in details.items():
+            assert f"source '{alias}'" in joined, (
+                f"Expected drifted source {alias!r} named in a strict-drift ERROR finding.\nstderr: {result.stderr!r}"
+            )
+            assert tip_sha[:12] in joined, (
+                f"Expected current tip SHA {tip_sha[:12]!r} for {alias!r} in the ERROR findings.\n"
+                f"stderr: {result.stderr!r}"
+            )
+
+
+@pytest.mark.integration
+class TestDoctorCycle:
+    """AC-CYCLE-001: End-to-end tamper cycle."""
+
+    def test_tampered_hash_detected_and_remediated(self, tmp_path: pathlib.Path) -> None:
+        """Tamper with lockfile mpm_hash; doctor detects it; rebuild fixes it.
+
+        Steps:
+        1. Create a real local bare repo with two commits (so SHA-pinned sources
+           are reachable and the dangling-SHA subcheck does not fire after
+           remediation).
+        2. Write .mpm pointing to the bare repo with a SHA-pinned source
+           (revision and resolved_sha both set to sha_b, the current HEAD).
+        3. Write a valid lockfile (correct mpm_hash, reachable SHA).
+        4. Tamper the lockfile by overwriting mpm_hash with a bad value.
+        5. Run doctor -- assert exit code 1 and 'mpm_hash mismatch' in stderr.
+        6. Restore the lockfile with the correct mpm_hash and the real SHA.
+        7. Re-run doctor -- assert exit code 0 (all subchecks pass).
+        """
+        bare_path, sha_a, sha_b = _create_bare_repo_with_two_commits(tmp_path, "cycle")
+        url = f"file://{bare_path}"
+
+        mpm_file = _write_mpm(tmp_path, "src", url, revision=sha_b)
+        from mpm_cli.core.mpm_hash import mpm_hash
+
+        real_hash = mpm_hash(mpm_file)
+        lock_path = tmp_path / ".mpm.lock"
+
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec=sha_b,
+            resolved_sha=sha_b,
+        )
+
+        content = lock_path.read_text(encoding="utf-8")
+        tampered = content.replace(f'mpm_hash = "{real_hash}"', 'mpm_hash = "sha256:' + "c" * 64 + '"')
+        lock_path.write_text(tampered, encoding="utf-8")
+
+        result1 = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(lock_path)],
+            cwd=tmp_path,
+        )
+        assert result1.returncode != 0, f"Expected non-zero exit. stderr: {result1.stderr!r}"
+        assert "mpm_hash mismatch" in result1.stderr
+
+        _write_lockfile(
+            tmp_path,
+            mpm_hash_val=real_hash,
+            source_name="src",
+            url=url,
+            revision_spec=sha_b,
+            resolved_sha=sha_b,
+        )
+
+        result2 = _run_mpm(
+            ["doctor", "--mpm-file", str(mpm_file), "--lock-file", str(lock_path)],
+            cwd=tmp_path,
+        )
+        assert result2.returncode == 0, (
+            "After restoring the lockfile with the correct hash and a reachable SHA, "
+            f"mpm doctor must exit 0. stderr: {result2.stderr!r}"
+        )

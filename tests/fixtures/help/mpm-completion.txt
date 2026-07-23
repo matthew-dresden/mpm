@@ -1,0 +1,22 @@
+usage: mpm completion [-h] <shell>
+
+Emit the shell completion script for mpm to stdout.
+
+Pipe the output to the appropriate location for your shell:
+
+  mpm completion bash > /etc/bash_completion.d/mpm
+  mpm completion zsh  > "${fpath[1]}/_mpm"
+  mpm completion powershell | Out-String | Invoke-Expression
+
+Then restart your shell or re-source the completion file.
+
+cmd.exe has no programmable tab-completion mechanism and is not a
+supported completion shell; see docs/shell-completion.md.
+
+See docs/shell-completion.md for full installation instructions.
+
+positional arguments:
+  <shell>     Target shell. Choices: {bash, zsh, powershell}.
+
+options:
+  -h, --help  show this help message and exit

@@ -1,0 +1,6 @@
+ERROR: .mpm has been modified since the lockfile was written.
+  Lockfile mpm_hash : sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  Current  mpm_hash : sha256:2391f761252aa51bfed01b99b60deb08da28644fb84c9b7a5037d42ff111df1a
+  Remediation: run 'mpm install --refresh-lock' to rebuild the entire
+  lockfile, or 'mpm install --refresh-lock-source <name>' to re-resolve
+  one source chain while preserving all other lockfile entries.

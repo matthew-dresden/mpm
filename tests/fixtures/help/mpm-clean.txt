@@ -1,0 +1,39 @@
+usage: mpm clean [-h] [--orphans] [--purge] [--purge-all] [mpmenv_path]
+
+Execute the full MPM clean lifecycle.
+
+If any dependency set MPM_SOURCE_<alias>_MARKETPLACE=true, runs
+the uninstall script and removes the marketplace directory. Then
+removes .packages/ and .mpm-data/ directories and prunes the
+content-addressed entries from the shared MPM_HOME store.
+
+With --orphans, before the normal teardown mpm also unregisters
+any mpm-owned marketplaces recorded in .mpm.lock that are no
+longer referenced by .mpm (pruning them from ~/.claude).
+
+With --purge, mpm also deletes this project's .mpm and
+.mpm.lock files. With --purge-all, it additionally removes the
+shared MPM_HOME store directory (default ~/.mpm-home); this
+runs even when no .mpm project is present.
+
+positional arguments:
+  mpmenv_path  Path to the .mpm configuration file (default: auto-discover
+               from current directory)
+
+options:
+  -h, --help   show this help message and exit
+  --orphans    Also unregister mpm-owned marketplaces no longer referenced by
+               .mpm/.mpm.lock (prunes them from ~/.claude).
+  --purge      Also delete this project's .mpm and .mpm.lock files after the
+               normal teardown (full removal of the project's mpm config).
+  --purge-all  Everything --purge does, and also remove the shared mpm home
+               store directory (MPM_HOME, default ~/.mpm-home) used by all
+               projects. Runs even when no .mpm project is present (removes
+               only the shared store).
+
+Example:
+  mpm clean             # auto-discovers .mpm
+  mpm clean .mpm      # explicit path
+  mpm clean --orphans   # also unregister orphaned marketplaces
+  mpm clean --purge     # also delete .mpm and .mpm.lock
+  mpm clean --purge-all # also remove the MPM_HOME store dir

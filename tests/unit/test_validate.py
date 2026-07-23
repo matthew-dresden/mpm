@@ -1,0 +1,104 @@
+"""Unit tests for src/mpm_cli/commands/validate.py.
+
+Covers:
+- The 'validate' subparser has add_help=True so '-h' is accepted.
+- Nested sub-subparsers ('xml', 'marketplace', 'metadata', 'lockfile') also accept '-h'.
+- The 'lockfile' sub-subcommand is registered and dispatches to its handler.
+"""
+
+import argparse
+
+import pytest
+
+
+def _find_sub_subparser(sub_sub: str):
+    """Return the registered sub-subparser for the given validate target name."""
+    from mpm_cli.commands.validate import register
+
+    root_parser = argparse.ArgumentParser()
+    subparsers = root_parser.add_subparsers(dest="command")
+    register(subparsers)
+    validate_parser = subparsers.choices["validate"]
+    for action in validate_parser._actions:
+        if hasattr(action, "choices") and action.choices and sub_sub in action.choices:
+            return action.choices[sub_sub]
+    raise AssertionError(f"No '{sub_sub}' sub-subparser found under 'validate'")
+
+
+@pytest.mark.unit
+class TestValidateSubparserHelp:
+    """The 'validate' subparser and its nested sub-subparsers accept '-h'."""
+
+    def test_validate_short_dash_h_exits_0(self) -> None:
+        """mpm validate -h exits 0 (add_help=True on the validate subparser)."""
+        from mpm_cli.cli import main
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", "-h"])
+        assert exc_info.value.code == 0
+
+    def test_validate_subparser_has_add_help_true(self) -> None:
+        """The 'validate' subparser has add_help=True set explicitly."""
+        from mpm_cli.commands.validate import register
+
+        root_parser = argparse.ArgumentParser()
+        subparsers = root_parser.add_subparsers(dest="command")
+        register(subparsers)
+        validate_parser = subparsers.choices["validate"]
+        assert validate_parser.add_help is True, "validate subparser must have add_help=True so '-h' is accepted"
+
+    @pytest.mark.parametrize("sub_sub", ["xml", "marketplace", "metadata", "lockfile"])
+    def test_validate_sub_subparser_has_add_help_true(self, sub_sub: str) -> None:
+        """Each validate sub-subparser ('xml', 'marketplace', 'metadata') has add_help=True."""
+        from mpm_cli.commands.validate import register
+
+        root_parser = argparse.ArgumentParser()
+        subparsers = root_parser.add_subparsers(dest="command")
+        register(subparsers)
+        validate_parser = subparsers.choices["validate"]
+        for action in validate_parser._actions:
+            if hasattr(action, "choices") and action.choices and sub_sub in action.choices:
+                sub_parser = action.choices[sub_sub]
+                assert sub_parser.add_help is True, (
+                    f"validate {sub_sub} sub-subparser must have add_help=True so '-h' is accepted"
+                )
+                return
+        raise AssertionError(f"No '{sub_sub}' sub-subparser found under 'validate'")
+
+    @pytest.mark.parametrize("sub_sub", ["xml", "marketplace", "metadata", "lockfile"])
+    def test_validate_sub_subcommand_dash_h_exits_0(self, sub_sub: str) -> None:
+        """'mpm validate <sub_sub> -h' exits 0 for each nested subcommand."""
+        from mpm_cli.cli import main
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", sub_sub, "-h"])
+        assert exc_info.value.code == 0
+
+    def test_validate_long_help_still_works(self) -> None:
+        """mpm validate --help still exits 0 (no regression in --help)."""
+        from mpm_cli.cli import main
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", "--help"])
+        assert exc_info.value.code == 0
+
+
+@pytest.mark.unit
+class TestValidateLockfileRegistration:
+    """The 'lockfile' sub-subcommand is registered alongside xml/marketplace/metadata."""
+
+    def test_lockfile_sub_subparser_dispatches_to_run_lockfile(self) -> None:
+        """The 'lockfile' sub-subparser sets func to the _run_lockfile handler."""
+        from mpm_cli.commands.validate import _run_lockfile
+
+        lock_parser = _find_sub_subparser("lockfile")
+        assert lock_parser.get_default("func") is _run_lockfile, (
+            "the 'lockfile' sub-subparser must dispatch to _run_lockfile"
+        )
+
+    def test_lockfile_sub_subparser_accepts_mpmenv_path_and_lock_file(self) -> None:
+        """The 'lockfile' sub-subparser declares the optional mpmenv_path and --lock-file."""
+        lock_parser = _find_sub_subparser("lockfile")
+        dest_names = {action.dest for action in lock_parser._actions}
+        assert "mpmenv_path" in dest_names, "lockfile target must accept an optional .mpm path"
+        assert "lock_file" in dest_names, "lockfile target must accept --lock-file"

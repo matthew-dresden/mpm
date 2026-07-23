@@ -1,0 +1,135 @@
+"""MS (Multi-Source) scenarios from `docs/integration-testing.md` §6.
+
+Scenarios automated:
+- MS-01: Two sources aggregate packages from both (disjoint package sets)
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+
+import pytest
+
+from tests.scenarios.conftest import (
+    mpm_clean,
+    mpm_install,
+    make_plain_repo,
+    write_mpmenv,
+)
+
+
+def _build_fixtures(base: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Build the fixture repos needed by MS scenarios.
+
+    Returns:
+        (pkg_alpha_bare, pkg_bravo_bare, manifest_primary_bare)
+
+    The manifest-primary repo contains:
+      - repo-specs/remote.xml
+      - repo-specs/alpha-only.xml  (declares only pkg-alpha)
+      - repo-specs/bravo-only.xml  (declares only pkg-bravo)
+    """
+    content_repos = base / "content-repos"
+    manifest_repos = base / "manifest-repos"
+    content_repos.mkdir(parents=True)
+    manifest_repos.mkdir(parents=True)
+
+    pkg_alpha_bare = make_plain_repo(
+        content_repos,
+        "pkg-alpha",
+        {"README.md": "# pkg-alpha\n"},
+    )
+    pkg_bravo_bare = make_plain_repo(
+        content_repos,
+        "pkg-bravo",
+        {"README.md": "# pkg-bravo\n"},
+    )
+
+    content_repos_url = content_repos.as_uri()
+
+    remote_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<manifest>\n"
+        f'  <remote name="local" fetch="{content_repos_url}/" />\n'
+        '  <default remote="local" revision="main" sync-j="4" />\n'
+        "</manifest>\n"
+    )
+    alpha_only_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<manifest>\n"
+        '  <include name="repo-specs/remote.xml" />\n'
+        '  <project name="pkg-alpha" path=".packages/pkg-alpha"'
+        ' remote="local" revision="main" />\n'
+        "</manifest>\n"
+    )
+    bravo_only_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<manifest>\n"
+        '  <include name="repo-specs/remote.xml" />\n'
+        '  <project name="pkg-bravo" path=".packages/pkg-bravo"'
+        ' remote="local" revision="main" />\n'
+        "</manifest>\n"
+    )
+
+    manifest_primary_bare = make_plain_repo(
+        manifest_repos,
+        "manifest-primary",
+        {
+            "repo-specs/remote.xml": remote_xml,
+            "repo-specs/alpha-only.xml": alpha_only_xml,
+            "repo-specs/bravo-only.xml": bravo_only_xml,
+        },
+    )
+
+    return pkg_alpha_bare, pkg_bravo_bare, manifest_primary_bare
+
+
+@pytest.mark.scenario
+class TestMS:
+    def test_ms_01_two_sources_aggregate_both(self, tmp_path: pathlib.Path) -> None:
+        """MS-01: Two sources with disjoint manifests aggregate packages from both."""
+        _, _, manifest_bare = _build_fixtures(tmp_path / "fixtures")
+
+        work_dir = tmp_path / "test-ms01"
+        work_dir.mkdir()
+
+        manifest_url = manifest_bare.as_uri()
+        write_mpmenv(
+            work_dir,
+            [
+                ("alpha", manifest_url, "main", "repo-specs/alpha-only.xml"),
+                ("bravo", manifest_url, "main", "repo-specs/bravo-only.xml"),
+            ],
+            marketplace_install="false",
+        )
+
+        catalog_source = f"{manifest_url}@main"
+        result = mpm_install(
+            work_dir,
+            extra_env={"MPM_CATALOG_SOURCE": catalog_source, "MPM_ALLOW_INSECURE_REMOTES": "1"},
+        )
+
+        assert result.returncode == 0, (
+            f"mpm install exited {result.returncode}\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+        assert "mpm install: done" in result.stdout, f"'mpm install: done' not in stdout: {result.stdout!r}"
+
+        store_base = pathlib.Path(os.environ["MPM_HOME"]) / "store"
+
+        assert (store_base / ".mpm-data" / "sources" / "alpha").is_dir(), ".mpm-data/sources/alpha/ directory missing"
+        assert (store_base / ".mpm-data" / "sources" / "bravo").is_dir(), ".mpm-data/sources/bravo/ directory missing"
+
+        packages_dir = store_base / ".packages"
+        assert packages_dir.is_dir(), ".packages/ directory missing"
+
+        pkg_alpha_link = packages_dir / "pkg-alpha"
+        assert pkg_alpha_link.is_symlink(), ".packages/pkg-alpha is not a symlink"
+
+        pkg_bravo_link = packages_dir / "pkg-bravo"
+        assert pkg_bravo_link.is_symlink(), ".packages/pkg-bravo is not a symlink"
+
+        assert pkg_alpha_link.resolve().exists(), ".packages/pkg-alpha symlink does not resolve"
+        assert pkg_bravo_link.resolve().exists(), ".packages/pkg-bravo symlink does not resolve"
+
+        mpm_clean(work_dir)

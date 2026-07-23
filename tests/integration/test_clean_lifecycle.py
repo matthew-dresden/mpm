@@ -1,0 +1,509 @@
+"""Integration tests for mpm clean lifecycle via CLI entry point (9 tests).
+
+Covers the clean command lifecycle from the CLI boundary:
+  - AC-TEST-001: mpm clean removes .packages/ and .mpm-data/
+  - AC-TEST-002: mpm clean with MPM_MARKETPLACE_INSTALL=true also removes marketplace directory
+  - AC-TEST-003: mpm clean is idempotent (clean of already-clean state succeeds)
+  - AC-FUNC-001: clean removes every artifact install created, nothing else
+  - AC-CHANNEL-001: stdout vs stderr discipline verified (no cross-channel leakage)
+  - AC-FUNC-004 / AC-FUNC-005: install records claude marketplace add, clean records reverse remove
+"""
+
+import json as _json
+import os
+import pathlib
+import subprocess
+import textwrap
+from unittest.mock import patch
+
+import pytest
+
+from mpm_cli.cli import main
+from mpm_cli.core.clean import clean
+from mpm_cli.core.install import install
+from tests.integration.test_add_core import _create_manifest_repo_with_tags
+
+
+def _store_base() -> pathlib.Path:
+    """Return the shared artifact store base (``<MPM_HOME>/store``).
+
+    install()/clean() create and remove ``.packages/`` and ``.mpm-data/``
+    under the shared store, not beside the project ``.mpm``.
+    The ``_isolate_mpm_home`` autouse fixture points MPM_HOME at a fresh
+    per-test temporary directory.
+    """
+    return pathlib.Path(os.environ["MPM_HOME"]) / "store"
+
+
+def _write_mpmenv(directory: pathlib.Path, extra_lines: str = "") -> pathlib.Path:
+    """Write a minimal valid .mpm file in directory and return its path.
+
+    Args:
+        directory: Directory in which to create the .mpm file.
+        extra_lines: Additional KEY=VALUE lines to append.
+
+    Returns:
+        Absolute path to the written .mpm file.
+    """
+    base = (
+        "MPM_SOURCE_primary_URL=https://example.com/primary.git\n"
+        "MPM_SOURCE_primary_REF=main\n"
+        "MPM_SOURCE_primary_PATH=meta.xml\n"
+        "MPM_SOURCE_primary_NAME=primary\n"
+        "MPM_SOURCE_primary_GITBASE=https://example.com\n"
+    )
+    mpmenv = directory / ".mpm"
+    mpmenv.write_text(base + extra_lines)
+    return mpmenv.resolve()
+
+
+def _create_install_artifacts(base_dir: pathlib.Path, packages: list[str]) -> None:
+    """Create .packages/ and .mpm-data/ artifacts as install would.
+
+    Args:
+        base_dir: Shared artifact store base (``<MPM_HOME>/store``), where
+            install()/clean() manage ``.packages/`` and ``.mpm-data/``.
+        packages: List of package names to create under .packages/.
+    """
+    packages_dir = base_dir / ".packages"
+    for pkg in packages:
+        pkg_dir = packages_dir / pkg
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        (pkg_dir / f"{pkg}.sh").write_text(f"#!/bin/sh\necho {pkg}\n")
+
+    mpm_data = base_dir / ".mpm-data" / "sources" / "primary"
+    mpm_data.mkdir(parents=True, exist_ok=True)
+    (mpm_data / "metadata.txt").write_text("source=primary\n")
+
+
+@pytest.mark.integration
+class TestCleanRemovesArtifacts:
+    """AC-TEST-001: mpm clean removes .packages/ and .mpm-data/ via CLI."""
+
+    def test_clean_removes_packages_and_mpm_data(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """AC-TEST-001: invoking 'mpm clean' removes .packages/ and .mpm-data/."""
+        mpmenv = _write_mpmenv(tmp_path)
+        store_base = _store_base()
+        _create_install_artifacts(store_base, ["tool-a", "tool-b"])
+
+        assert (store_base / ".packages").exists(), "precondition: .packages/ must exist before clean"
+        assert (store_base / ".mpm-data").exists(), "precondition: .mpm-data/ must exist before clean"
+
+        main(["clean", str(mpmenv)])
+
+        assert not (store_base / ".packages").exists(), "mpm clean must remove .packages/"
+        assert not (store_base / ".mpm-data").exists(), "mpm clean must remove .mpm-data/"
+
+    def test_clean_removes_nested_packages_content(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """AC-TEST-001: clean removes all nested content inside .packages/."""
+        mpmenv = _write_mpmenv(tmp_path)
+        store_base = _store_base()
+        nested = store_base / ".packages" / "tool-a" / "subdir"
+        nested.mkdir(parents=True)
+        (nested / "file.txt").write_text("content")
+        (store_base / ".mpm-data").mkdir(parents=True)
+
+        main(["clean", str(mpmenv)])
+
+        assert not (store_base / ".packages").exists(), "mpm clean must remove .packages/ including nested content"
+
+
+@pytest.mark.integration
+class TestCleanWithMarketplace:
+    """AC-TEST-002: mpm clean with marketplace enabled removes marketplace directory."""
+
+    def test_clean_marketplace_true_removes_marketplace_directory(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """AC-TEST-002: MPM_MARKETPLACE_INSTALL=true causes clean to remove marketplace dir."""
+        marketplace_dir = tmp_path / "marketplaces"
+        marketplace_dir.mkdir()
+        (marketplace_dir / "some-marketplace-plugin.txt").write_text("plugin data")
+
+        mpmenv = _write_mpmenv(
+            tmp_path,
+            (
+                f"CLAUDE_MARKETPLACES_DIR={marketplace_dir}\n"
+                "MPM_SOURCE_toola_URL=https://example.com/repo.git\n"
+                "MPM_SOURCE_toola_REF=main\n"
+                "MPM_SOURCE_toola_PATH=repo-specs/manifest.xml\n"
+                "MPM_SOURCE_toola_NAME=toola\n"
+                "MPM_SOURCE_toola_GITBASE=https://example.com\n"
+                "MPM_SOURCE_toola_MARKETPLACE=true\n"
+            ),
+        )
+        store_base = _store_base()
+        _create_install_artifacts(store_base, ["tool-a"])
+
+        with patch("mpm_cli.core.clean.uninstall_marketplace_plugins"):
+            main(["clean", str(mpmenv)])
+
+        assert not marketplace_dir.exists(), (
+            "mpm clean with MPM_MARKETPLACE_INSTALL=true must remove CLAUDE_MARKETPLACES_DIR"
+        )
+        assert not (store_base / ".packages").exists(), "mpm clean with marketplace=true must also remove .packages/"
+        assert not (store_base / ".mpm-data").exists(), "mpm clean with marketplace=true must also remove .mpm-data/"
+
+    def test_clean_marketplace_false_does_not_touch_unrelated_dirs(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """AC-FUNC-001: clean with marketplace disabled does not remove unrelated directories."""
+        other_dir = tmp_path / "other-data"
+        other_dir.mkdir()
+        (other_dir / "keep.txt").write_text("user data")
+
+        mpmenv = _write_mpmenv(tmp_path)
+        _create_install_artifacts(_store_base(), ["tool-a"])
+
+        main(["clean", str(mpmenv)])
+
+        assert other_dir.exists(), "clean must not remove directories it does not own"
+        assert (other_dir / "keep.txt").exists(), "clean must not remove user files"
+
+
+@pytest.mark.integration
+class TestCleanIdempotent:
+    """AC-TEST-003: mpm clean is idempotent when run on an already-clean directory."""
+
+    def test_clean_on_already_clean_dir_succeeds(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """AC-TEST-003: 'mpm clean' on a directory without artifacts exits zero."""
+        mpmenv = _write_mpmenv(tmp_path)
+        store_base = _store_base()
+
+        assert not (store_base / ".packages").exists(), "precondition: .packages/ must not exist"
+        assert not (store_base / ".mpm-data").exists(), "precondition: .mpm-data/ must not exist"
+
+        main(["clean", str(mpmenv)])
+
+        assert not (store_base / ".packages").exists(), "idempotent clean: .packages/ must remain absent"
+        assert not (store_base / ".mpm-data").exists(), "idempotent clean: .mpm-data/ must remain absent"
+
+    def test_clean_twice_in_succession_both_succeed(
+        self,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """AC-TEST-003: running 'mpm clean' twice on the same directory succeeds both times."""
+        mpmenv = _write_mpmenv(tmp_path)
+        store_base = _store_base()
+        _create_install_artifacts(store_base, ["tool-a"])
+
+        main(["clean", str(mpmenv)])
+
+        assert not (store_base / ".packages").exists(), "first clean must remove .packages/"
+        assert not (store_base / ".mpm-data").exists(), "first clean must remove .mpm-data/"
+
+        main(["clean", str(mpmenv)])
+
+        assert not (store_base / ".packages").exists(), "second clean must not fail when .packages/ absent"
+        assert not (store_base / ".mpm-data").exists(), "second clean must not fail when .mpm-data/ absent"
+
+
+@pytest.mark.integration
+class TestCleanPreservesNonManagedFiles:
+    """AC-FUNC-001 and AC-CHANNEL-001: clean removes only managed artifacts."""
+
+    def test_clean_preserves_mpmenv_and_user_files(
+        self,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """AC-FUNC-001: clean does not remove .mpm, .gitignore, or user source files."""
+        mpmenv = _write_mpmenv(tmp_path)
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(".packages/\n.mpm-data/\n")
+        user_file = tmp_path / "src" / "app.py"
+        user_file.parent.mkdir(parents=True)
+        user_file.write_text("# user code\n")
+
+        _create_install_artifacts(_store_base(), ["tool-a"])
+
+        main(["clean", str(mpmenv)])
+
+        assert mpmenv.exists(), "AC-FUNC-001: clean must not remove the .mpm file"
+        assert gitignore.exists(), "AC-FUNC-001: clean must not remove .gitignore"
+        assert user_file.exists(), "AC-FUNC-001: clean must not remove user source files"
+
+    def test_clean_success_output_goes_to_stdout_not_stderr(
+        self,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """AC-CHANNEL-001: progress messages from clean go to stdout; stderr must be empty on success."""
+        mpmenv = _write_mpmenv(tmp_path)
+        _create_install_artifacts(_store_base(), ["tool-a"])
+
+        main(["clean", str(mpmenv)])
+
+        captured = capsys.readouterr()
+        assert captured.err == "", (
+            f"AC-CHANNEL-001: no output expected on stderr during clean success; stderr={captured.err!r}"
+        )
+        assert "clean" in captured.out.lower() or ".packages" in captured.out, (
+            f"AC-CHANNEL-001: progress output expected on stdout during clean; stdout={captured.out!r}"
+        )
+
+
+_MANIFEST_WITH_LINKFILE_TEMPLATE = textwrap.dedent("""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <manifest>
+      <project name="{name}" path="{name}" remote="origin" revision="main">
+        <linkfile src=".claude-plugin/marketplace.json"
+                  dest="{marketplace_dest}/.claude-plugin/marketplace.json" />
+      </project>
+    </manifest>
+""")
+
+_MARKETPLACE_JSON_TEMPLATE = '{{"name": "{name}", "plugins": []}}'
+
+
+def _make_repo_init_with_linkfiles(marketplace_dir: pathlib.Path) -> object:
+    """Return a fake_repo_init side-effect that writes manifests with linkfile elements.
+
+    Each call to ``repo_init`` writes a manifest XML at the path that
+    ``install()`` expects after ``repo init + repo sync``. The manifest
+    contains a ``<linkfile>`` element whose ``dest`` points into
+    ``marketplace_dir/<source-name>/``. Also writes the corresponding
+    ``.claude-plugin/marketplace.json`` src file so that
+    ``_process_manifest_linkfiles`` in ``install.py`` can copy it to the
+    dest path (the E35 fix path).
+
+    Args:
+        marketplace_dir: Root marketplace directory (CLAUDE_MARKETPLACES_DIR).
+
+    Returns:
+        A callable suitable for use as ``side_effect`` on a mock.
+    """
+
+    def fake_repo_init(
+        repo_dir: str,
+        url: str,
+        revision: str,
+        manifest_path: str,
+        repo_rev: str = "",
+    ) -> None:
+        manifest_file = pathlib.Path(repo_dir) / ".repo" / "manifests" / manifest_path
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+
+        stem = pathlib.Path(manifest_path).name
+        if stem.endswith("-marketplace.xml"):
+            source_name = stem[: -len("-marketplace.xml")]
+        else:
+            source_name = stem.replace(".xml", "")
+
+        marketplace_dest = marketplace_dir / source_name
+        manifest_file.write_text(
+            _MANIFEST_WITH_LINKFILE_TEMPLATE.format(
+                name=source_name,
+                marketplace_dest=str(marketplace_dest),
+            )
+        )
+
+        src_file = pathlib.Path(repo_dir) / source_name / ".claude-plugin" / "marketplace.json"
+        src_file.parent.mkdir(parents=True, exist_ok=True)
+        src_file.write_text(_MARKETPLACE_JSON_TEMPLATE.format(name=source_name))
+
+    return fake_repo_init
+
+
+def _filter_argvs_by_subcommand(
+    recorded_argvs: list[list], subcommand_tokens: tuple[str, ...]
+) -> list[tuple[str, ...]]:
+    """Filter recorded argv lists matching the given subcommand prefix.
+
+    Filters calls whose argv tokens after the binary name start with
+    ``subcommand_tokens``.
+
+    Args:
+        recorded_argvs: List of raw argv lists as passed to subprocess.run.
+        subcommand_tokens: Tuple of expected argv tokens after the binary name,
+            e.g. ``("plugin", "marketplace", "add")`` or
+            ``("plugin", "marketplace", "remove")``.
+
+    Returns:
+        List of full argv tuples, one per matching call, in call order.
+    """
+    result = []
+    token_count = len(subcommand_tokens)
+    for argv_list in recorded_argvs:
+        argv = tuple(str(a) for a in argv_list)
+        if len(argv) >= token_count + 1 and argv[1 : token_count + 1] == subcommand_tokens:
+            result.append(argv)
+    return result
+
+
+@pytest.mark.integration
+class TestCleanMarketplaceTrue:
+    """AC-FUNC-004 / AC-FUNC-005: install registers, clean deregisters marketplace plugins."""
+
+    def test_clean_removes_registered_marketplace(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """install() records marketplace add calls; clean() records the reverse remove calls.
+
+        Builds a 2-source synthetic catalog using ``_create_manifest_repo_with_tags``
+        (spec section 3.1). The ``fake_repo_init`` side effect writes manifest XML
+        with ``<linkfile>`` elements and creates the corresponding
+        ``.claude-plugin/marketplace.json`` src files so that
+        ``_process_manifest_linkfiles`` in ``install.py`` deposits them under
+        ``CLAUDE_MARKETPLACES_DIR`` (the E35 fix path).
+
+        Both install and clean use the same subprocess.run mock so all invocations
+        are recorded in a single list. After install, the recorded
+        ``claude plugin marketplace add`` calls are extracted and validated.
+        After clean, the recorded ``claude plugin marketplace remove`` calls are
+        extracted and validated: one remove per prior add, with the marketplace
+        name matching the name field from each marketplace.json, with no extra
+        calls in either direction.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        monkeypatch.delenv("MPM_MARKETPLACE_INSTALL", raising=False)
+
+        marketplace_dir = tmp_path / "marketplace"
+        marketplace_dir.mkdir()
+
+        bare_alpha = _create_manifest_repo_with_tags(
+            tmp_path / "repo-alpha",
+            entry_names=["source-alpha"],
+            tags=["1.0.0"],
+        )
+        bare_bravo = _create_manifest_repo_with_tags(
+            tmp_path / "repo-bravo",
+            entry_names=["source-bravo"],
+            tags=["1.0.0"],
+        )
+
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
+        mpmenv = workspace_dir / ".mpm"
+        mpmenv.write_text(
+            f"CLAUDE_MARKETPLACES_DIR={marketplace_dir}\n"
+            f"MPM_SOURCE_source_alpha_URL=file://{bare_alpha}\n"
+            f"MPM_SOURCE_source_alpha_REF=main\n"
+            f"MPM_SOURCE_source_alpha_PATH=repo-specs/source-alpha-marketplace.xml\n"
+            f"MPM_SOURCE_source_alpha_NAME=source_alpha\n"
+            f"MPM_SOURCE_source_alpha_GITBASE=https://example.com\n"
+            f"MPM_SOURCE_source_alpha_MARKETPLACE=true\n"
+            f"MPM_SOURCE_source_bravo_URL=file://{bare_bravo}\n"
+            f"MPM_SOURCE_source_bravo_REF=main\n"
+            f"MPM_SOURCE_source_bravo_PATH=repo-specs/source-bravo-marketplace.xml\n"
+            f"MPM_SOURCE_source_bravo_NAME=source_bravo\n"
+            f"MPM_SOURCE_source_bravo_GITBASE=https://example.com\n"
+            f"MPM_SOURCE_source_bravo_MARKETPLACE=true\n"
+        )
+        mpmenv = mpmenv.resolve()
+
+        claude_bin = "/usr/bin/claude"
+        mock_completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        install_call_args: list = []
+        clean_call_args: list = []
+
+        def recording_run_install(args, **kwargs):
+            install_call_args.append(args)
+            return mock_completed
+
+        def recording_run_clean(args, **kwargs):
+            clean_call_args.append(args)
+            return mock_completed
+
+        with (
+            patch(
+                "mpm_cli.repo.repo_init",
+                side_effect=_make_repo_init_with_linkfiles(marketplace_dir),
+            ),
+            patch("mpm_cli.repo.repo_envsubst"),
+            patch("mpm_cli.repo.repo_sync"),
+            patch(
+                "mpm_cli.core.marketplace.shutil.which",
+                return_value=claude_bin,
+            ),
+            patch(
+                "mpm_cli.core.marketplace.subprocess.run",
+                side_effect=recording_run_install,
+            ),
+        ):
+            install(
+                mpmenv,
+                lock_file_path=mpmenv.parent / ".mpm.lock",
+            )
+
+        add_argvs = _filter_argvs_by_subcommand(
+            install_call_args,
+            ("plugin", "marketplace", "add"),
+        )
+
+        assert len(add_argvs) >= 1, (
+            f"AC-FUNC-004: install() must invoke 'claude plugin marketplace add' at least once "
+            f"when MPM_MARKETPLACE_INSTALL=true, but no such calls were recorded. "
+            f"All install subprocess.run args: {install_call_args!r}"
+        )
+
+        add_names_in_order: list[str] = []
+        for argv in add_argvs:
+            entry_path = pathlib.Path(argv[4])
+            json_path = entry_path / ".claude-plugin" / "marketplace.json"
+            assert json_path.exists(), (
+                f"AC-FUNC-004: marketplace.json must exist at {json_path} "
+                f"for entry path {entry_path!r} from recorded add call {argv!r}"
+            )
+            marketplace_data = _json.loads(json_path.read_text())
+            add_names_in_order.append(marketplace_data["name"])
+
+        assert len(add_names_in_order) >= 1, (
+            f"AC-FUNC-004: expected at least one marketplace name from add calls, but add_argvs={add_argvs!r}"
+        )
+
+        with (
+            patch(
+                "mpm_cli.core.marketplace.shutil.which",
+                return_value=claude_bin,
+            ),
+            patch(
+                "mpm_cli.core.marketplace.subprocess.run",
+                side_effect=recording_run_clean,
+            ),
+        ):
+            clean(mpmenv)
+
+        remove_argvs = _filter_argvs_by_subcommand(
+            clean_call_args,
+            ("plugin", "marketplace", "remove"),
+        )
+
+        remove_names: list[str] = [argv[4] for argv in remove_argvs]
+
+        assert len(remove_names) == len(add_names_in_order), (
+            f"AC-FUNC-005: clean() must invoke 'claude plugin marketplace remove' exactly "
+            f"once per prior 'add' call. Expected {len(add_names_in_order)} remove call(s) "
+            f"(names={add_names_in_order!r}) but got {len(remove_names)} (names={remove_names!r}). "
+            f"All clean subprocess.run args: {clean_call_args!r}"
+        )
+
+        for expected_name in add_names_in_order:
+            assert expected_name in remove_names, (
+                f"AC-FUNC-005: marketplace name {expected_name!r} was registered via "
+                f"'claude plugin marketplace add' during install but no matching "
+                f"'claude plugin marketplace remove {expected_name}' was recorded during clean. "
+                f"Recorded remove names: {remove_names!r}"
+            )
