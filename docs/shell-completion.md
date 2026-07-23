@@ -135,7 +135,7 @@ mpm completion zsh > ~/.zsh/completions/_mpm
 
 **When to regenerate:**
 
-- After running `pipx upgrade missing-package-manager` or any other upgrade method.
+- After running `pipx upgrade mpm-cli` or any other upgrade method.
 - After installing mpm in a new environment.
 - When `mpm doctor` emits a completion-script staleness warning.
 

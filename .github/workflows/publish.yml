@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: pypi
-      url: https://pypi.org/p/missing-package-manager
+      url: https://pypi.org/p/mpm-cli
     permissions:
       id-token: write
     env:

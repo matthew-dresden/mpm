@@ -285,13 +285,13 @@ Ensure the same testing, linting, security scanning, and deployment automation a
 
 ### Install the MPM CLI
 
-`missing-package-manager` is published to [PyPI](https://pypi.org/project/missing-package-manager/). The
+`mpm-cli` is published to [PyPI](https://pypi.org/project/mpm-cli/). The
 recommended install method depends on the use case:
 
 **Production / general use** -- isolated CLI install via pipx:
 
 ```bash
-pipx install missing-package-manager
+pipx install mpm-cli
 ```
 
 **Local development on this repository** -- editable install into the
@@ -302,7 +302,7 @@ pip install -e .
 ```
 
 (Editable mode lets local source edits take effect immediately without
-reinstalling. CI uses `pip install missing-package-manager` for ephemeral runners; see
+reinstalling. CI uses `pip install mpm-cli` for ephemeral runners; see
 `docs/pipeline-integration.md`.)
 
 ### Standalone Usage (No Task Runner Required)

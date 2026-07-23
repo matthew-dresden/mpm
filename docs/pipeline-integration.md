@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install mpm
         shell: bash
-        run: pipx install missing-package-manager
+        run: pipx install mpm-cli
       - name: MPM Install
         shell: bash
         run: mpm install .mpm
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install mpm
         shell: bash
-        run: pipx install missing-package-manager
+        run: pipx install mpm-cli
       - name: MPM Clean
         shell: bash
         run: mpm clean .mpm

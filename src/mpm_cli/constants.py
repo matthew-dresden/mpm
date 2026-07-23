@@ -215,14 +215,14 @@ MPM_REPO_DIR_ENV = "MPM_REPO_DIR"
 MPMENV_REPO_DIR_DEFAULT = ".repo"
 
 
-SELFUPDATE_EMBEDDED_MESSAGE = "selfupdate is not available -- upgrade mpm instead: pipx upgrade missing-package-manager"
+SELFUPDATE_EMBEDDED_MESSAGE = "selfupdate is not available -- upgrade mpm instead: pipx upgrade mpm-cli"
 
 
-MPM_PYPI_PROJECT_NAME = "missing-package-manager"
-MPM_PYPI_JSON_URL = "https://pypi.org/pypi/missing-package-manager/json"
+MPM_PYPI_PROJECT_NAME = "mpm-cli"
+MPM_PYPI_JSON_URL = "https://pypi.org/pypi/mpm-cli/json"
 
 
-MPM_UPDATE_UPGRADE_COMMAND = "pipx upgrade missing-package-manager"
+MPM_UPDATE_UPGRADE_COMMAND = "pipx upgrade mpm-cli"
 
 
 MPM_SKIP_UPDATE_CHECK_ENV = "MPM_SKIP_UPDATE_CHECK"

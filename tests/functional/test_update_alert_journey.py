@@ -4,7 +4,7 @@ Exercises the "update available" alert end to end:
 
 - The alert prints to **stderr** (never stdout) when the cached PyPI version is
   stale relative to the installed version, naming the available version and the
-  ``pipx upgrade missing-package-manager`` upgrade command.
+  ``pipx upgrade mpm-cli`` upgrade command.
 - The alert is **silent** when the installed version is up to date.
 - The check is **skipped** for dev/editable installs, the ``--no-update-check``
   global flag, and ``MPM_SKIP_UPDATE_CHECK=1``.

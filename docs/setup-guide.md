@@ -14,7 +14,7 @@ Step-by-step instructions for setting up MPM in new and existing projects.
 For end-user / production use (isolated CLI from PyPI):
 
 ```bash
-pipx install missing-package-manager
+pipx install mpm-cli
 ```
 
 For local development on the mpm repository itself, install it
@@ -84,7 +84,7 @@ For existing projects, follow the same steps above but adapt your existing build
 ### `mpm: command not found`
 
 The `mpm` CLI must be installed before running any `mpm` command.
-Install it with `pipx install missing-package-manager` (production) or `pip install -e .`
+Install it with `pipx install mpm-cli` (production) or `pip install -e .`
 (local development on this repository). The `mpm repo` subsystem is part of
 the `mpm` CLI -- there is no separate tool to install.
 

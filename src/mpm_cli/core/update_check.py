@@ -26,7 +26,7 @@ Design contract (spec Section 7.1 / Section 7.3 / Section 3.5):
 - The alert is written to **stderr** (never stdout, so ``--format json`` / pipes /
   completion scripts stay clean), is colored only when stderr is a TTY and
   ``NO_COLOR`` is unset, names the available version and the
-  ``pipx upgrade missing-package-manager`` upgrade command, and is **silent when the installed
+  ``pipx upgrade mpm-cli`` upgrade command, and is **silent when the installed
   version is current** (it speaks only on an available upgrade).
 - A failed, timed-out, or oversized lookup prints **no alert** and **never
   errors** the command. This graceful-fail is intentional and bounded: the update

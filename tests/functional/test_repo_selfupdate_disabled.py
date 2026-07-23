@@ -11,7 +11,7 @@ capture_output=True, asserting exact channel discipline per AC-TEST-001.
 
 AC-FUNC-001: 'mpm repo selfupdate' exits non-zero (exit code 1).
 AC-FUNC-002: stderr contains the literal string
-    'selfupdate is not available -- upgrade mpm instead: pipx upgrade missing-package-manager'.
+    'selfupdate is not available -- upgrade mpm instead: pipx upgrade mpm-cli'.
 AC-TEST-001: captures stdout and stderr separately; asserts documented message
     is on stderr and exit code is 1.
 

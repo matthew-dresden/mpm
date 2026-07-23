@@ -459,7 +459,7 @@ class TestRepoSelfupdateEmbeddedMode:
         """'mpm repo selfupdate' must print the SELFUPDATE_EMBEDDED_MESSAGE constant.
 
         In embedded mode the selfupdate subcommand must print the message
-        directing users to use 'pipx upgrade missing-package-manager' instead. Verifies
+        directing users to use 'pipx upgrade mpm-cli' instead. Verifies
         the full constant value appears in the combined output.
         """
         repo_dot_dir = _create_minimal_repo_dot_dir(tmp_path)

@@ -865,11 +865,11 @@ class TestRepoSelfupdateEmbeddedMessage:
         """mpm repo selfupdate emits the 'not available' message and exits 1.
 
         The selfupdate subcommand in embedded mode prints a message to stderr
-        that tells users to use 'pipx upgrade missing-package-manager' instead of running
+        that tells users to use 'pipx upgrade mpm-cli' instead of running
         selfupdate. This test verifies:
         - The command exits with code 1 (updated per E2-F2-S2-T2, declared in E2-F2-S2-T3).
         - The combined output contains 'not available'.
-        - The combined output contains 'pipx upgrade missing-package-manager'.
+        - The combined output contains 'pipx upgrade mpm-cli'.
 
         A minimal .repo directory is required for mpm repo to locate the
         embedded repo tool. This test creates one inline.
@@ -898,8 +898,8 @@ class TestRepoSelfupdateEmbeddedMessage:
             f"  stdout: {selfupdate_result.stdout!r}\n"
             f"  stderr: {selfupdate_result.stderr!r}"
         )
-        assert "pipx upgrade missing-package-manager" in combined, (
-            f"Expected 'pipx upgrade missing-package-manager' in selfupdate output.\n"
+        assert "pipx upgrade mpm-cli" in combined, (
+            f"Expected 'pipx upgrade mpm-cli' in selfupdate output.\n"
             f"  stdout: {selfupdate_result.stdout!r}\n"
             f"  stderr: {selfupdate_result.stderr!r}"
         )

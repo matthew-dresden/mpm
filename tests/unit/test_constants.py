@@ -2509,9 +2509,9 @@ class TestUpdateCheckConstants:
             MPM_UPDATE_UPGRADE_COMMAND,
         )
 
-        assert MPM_PYPI_PROJECT_NAME == "missing-package-manager"
-        assert MPM_PYPI_JSON_URL == "https://pypi.org/pypi/missing-package-manager/json"
-        assert MPM_UPDATE_UPGRADE_COMMAND == "pipx upgrade missing-package-manager"
+        assert MPM_PYPI_PROJECT_NAME == "mpm-cli"
+        assert MPM_PYPI_JSON_URL == "https://pypi.org/pypi/mpm-cli/json"
+        assert MPM_UPDATE_UPGRADE_COMMAND == "pipx upgrade mpm-cli"
 
     def test_default_ttl_is_10800(self) -> None:
         """MPM_UPDATE_CHECK_TTL default is 10800 (3h)."""

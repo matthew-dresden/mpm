@@ -443,7 +443,7 @@ WARN: Stale bash completion script: /home/user/.local/share/bash-completion/comp
 ```bash
 # install the completion script, upgrade mpm, then run doctor
 mpm completion bash > ~/.local/share/bash-completion/completions/mpm
-pip install --upgrade missing-package-manager
+pip install --upgrade mpm-cli
 mpm doctor
 # warns that the static script needs regeneration
 ```

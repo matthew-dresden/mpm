@@ -13,9 +13,9 @@ your own configuration:
   manifest repos and package repos you declare in `.mpm` (or pass on the command
   line). These go to the hosts in your own URLs, using your own git credentials.
 - **PyPI update check.** A single best-effort `GET` to
-  `https://pypi.org/pypi/missing-package-manager/json` to tell you when a newer
+  `https://pypi.org/pypi/mpm-cli/json` to tell you when a newer
   release is available. It sends nothing but the standard HTTP request and a
-  `User-Agent` of `missing-package-manager/<installed-version>`. Skip it with
+  `User-Agent` of `mpm-cli/<installed-version>`. Skip it with
   `--no-update-check` or `MPM_SKIP_UPDATE_CHECK=1`; see
   [docs/configuration.md](configuration.md) for the timeout and TTL knobs.
 

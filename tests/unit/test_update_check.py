@@ -591,8 +591,8 @@ def test_constants_defaults_match_spec() -> None:
     assert constants.MPM_UPDATE_CONNECT_TIMEOUT == 2
     assert constants.MPM_UPDATE_READ_TIMEOUT == 3
     assert constants.MPM_UPDATE_BODY_SIZE_CAP == 200 * 1024
-    assert constants.MPM_PYPI_JSON_URL == "https://pypi.org/pypi/missing-package-manager/json"
-    assert constants.MPM_UPDATE_UPGRADE_COMMAND == "pipx upgrade missing-package-manager"
+    assert constants.MPM_PYPI_JSON_URL == "https://pypi.org/pypi/mpm-cli/json"
+    assert constants.MPM_UPDATE_UPGRADE_COMMAND == "pipx upgrade mpm-cli"
 
 
 @pytest.mark.unit

@@ -578,7 +578,7 @@ number of completion error lines surfaced by `mpm doctor` (subcheck
 
 ### Update check
 
-mpm performs a best-effort PyPI check for a newer `missing-package-manager` release
+mpm performs a best-effort PyPI check for a newer `mpm-cli` release
 and prints an upgrade hint when one is available. The check is cached and
 never blocks a command on failure. When an upgrade is available the banner
 is yellow with the current (installed) version in red and the latest

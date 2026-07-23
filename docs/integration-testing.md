@@ -96,7 +96,7 @@ bootstrap-based workflows.
 **Post-release (from PyPI):**
 
 ```bash
-pipx install missing-package-manager
+pipx install mpm-cli
 ```
 
 **Pre-merge (editable from local checkout):**
@@ -1550,7 +1550,7 @@ These tests originally verified that `--catalog-source` and `MPM_CATALOG_SOURCES
 Run this category twice:
 
 1. **Pre-merge:** with mpm installed in editable mode (`pip install -e .`) from the local checkout
-2. **Post-release:** with mpm installed from PyPI (`pipx install missing-package-manager`) after the release
+2. **Post-release:** with mpm installed from PyPI (`pipx install mpm-cli`) after the release
 
 ### Fixture setup
 
@@ -5280,7 +5280,7 @@ grep -q "selfupdate is not available" /tmp/rp-wrap-04-stderr.log \
   && echo "PASS"
 ```
 
-**Pass criteria:** Exit code 1; stderr contains `selfupdate is not available -- upgrade mpm instead: pipx upgrade missing-package-manager`; stdout is empty.
+**Pass criteria:** Exit code 1; stderr contains `selfupdate is not available -- upgrade mpm instead: pipx upgrade mpm-cli`; stdout is empty.
 
 ### Cleanup
 
