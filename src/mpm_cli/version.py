@@ -4,7 +4,7 @@ Resolves version specifiers like ``refs/tags/~=1.0.0``,
 ``refs/tags/prefix/>=1.0.0,<2.0.0``, ``refs/tags/*`` against available git
 tags using the ``packaging`` library.
 
-Supports the same constraint syntax as rpm-git-repo manifest ``<project>``
+Supports the same constraint syntax as mpm's manifest ``<project>``
 revision attributes:
 - Operators: ~=, >=, <=, >, <, ==, !=
 - Wildcard: *
@@ -84,7 +84,7 @@ def resolve_version(url: str, rev_spec: str) -> str:
     """Resolve a version specifier against git tags.
 
     Supports PEP 440 constraint syntax in the last path component, mirroring
-    the constraint resolution in rpm-git-repo manifest ``<project>`` blocks.
+    the constraint resolution in mpm's manifest ``<project>`` blocks.
     The constraint may optionally be prefixed with a tag path:
 
     - ``~=1.0.0`` -- bare constraint, resolves against all tags

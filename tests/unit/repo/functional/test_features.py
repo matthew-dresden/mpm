@@ -1,4 +1,4 @@
-"""Functional tests for RPM-specific features.
+"""Functional tests for mpm-specific features.
 
 These tests exercise the features added over the Google upstream repo tool,
 running real commands and verifying I/O behavior.

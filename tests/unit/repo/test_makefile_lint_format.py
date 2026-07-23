@@ -1,6 +1,6 @@
 """Tests for Makefile lint, format, and check targets.
 
-Validates that the rpm-git-repo Makefile lint/format/check targets invoke the
+Validates that the project Makefile lint/format/check targets invoke the
 correct tools: ruff for Python linting and formatting.
 """
 

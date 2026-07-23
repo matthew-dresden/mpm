@@ -59,7 +59,7 @@ class InitExecuteRepoRevGuard(unittest.TestCase):
     def test_check_repo_rev_skipped_when_worktree_absent(self):
         """check_repo_rev must not be called when .repo/repo does not exist."""
         cmd = self._make_cmd_with_worktree("/nonexistent/path/.repo/repo")
-        opt = self._make_opt(repo_rev="feat/initial-rpm-git-repo")
+        opt = self._make_opt(repo_rev="feat/initial-sync-engine")
 
         with (
             mock.patch("mpm_cli.repo.subcmds.init.Wrapper") as MockWrapper,

@@ -1,6 +1,6 @@
 """Tests for .yamllint configuration.
 
-Validates that the rpm-git-repo yamllint configuration is valid and
+Validates that the project yamllint configuration is valid and
 catches known-bad YAML patterns in test fixtures.
 """
 

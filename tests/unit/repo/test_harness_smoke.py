@@ -1,4 +1,4 @@
-"""Smoke tests for the git-repo test harness.
+"""Smoke tests for the repo subsystem test harness.
 
 Exercises all conftest.py fixtures to verify the test harness
 is fully operational. Also validates that make targets work correctly.

@@ -5606,7 +5606,7 @@ argparse rejects it as an unknown command. Operators should use `mpm install`
 with an explicit catalog source instead.
 
 ```bash
-cd /workspaces/rpm-migration/mpm && pip install -e . > /dev/null
+cd /workspaces/mpm-workspace/mpm && pip install -e . > /dev/null
 mkdir -p "${MPM_TEST_ROOT}/uj-01"
 cd "${MPM_TEST_ROOT}/uj-01"
 mpm bootstrap mpm

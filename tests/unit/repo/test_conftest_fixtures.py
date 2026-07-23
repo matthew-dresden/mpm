@@ -1,7 +1,7 @@
 """Tests for the repo-specific conftest.py fixtures.
 
-Validates that each fixture adapted from rpm-git-repo is discoverable
-by pytest and produces expected state when invoked.
+Validates that each fixture adapted from the vendored ``repo`` engine test
+suite is discoverable by pytest and produces expected state when invoked.
 
 Fixtures under test:
 - reset_color_default

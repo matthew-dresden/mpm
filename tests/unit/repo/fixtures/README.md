@@ -1,6 +1,6 @@
 # Test Fixtures
 
-Golden reference files for git-repo test suite.
+Golden reference files for the `mpm repo` subsystem test suite.
 
 ## Files
 

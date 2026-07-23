@@ -12,7 +12,7 @@ sweep for that slug stays clean while this guard keeps searching for it.
 Covered acceptance criteria:
   - AC-FUNC-001: constants.py does not contain an org-specific review branch
   - AC-FUNC-003: catalog .mpm has no REPO_URL or REPO_REV lines
-  - AC-FUNC-004: mpm-readme.md has no reference to rpm-git-repo as external tool
+  - AC-FUNC-004: mpm-readme.md has no reference to the retired internal codename as external tool
   - AC-TEST-001: Automated scan of src/ for hard-coded org-specific values passes
 """
 

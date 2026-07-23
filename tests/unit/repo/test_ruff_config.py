@@ -1,6 +1,6 @@
 """Tests for ruff configuration in pyproject.toml.
 
-Validates that the rpm-git-repo ruff configuration is valid and catches
+Validates that the project ruff configuration is valid and catches
 known-bad Python patterns in test fixtures.
 """
 

@@ -7,7 +7,7 @@ the doc's bash helpers (`rp_ro_setup`, `mk_rx_xml`, `mk_mfst_xml`, `pk_xml`,
 `mk_plugin_repo`, `cs_catalog_repo`, etc.) so individual scenario tests can
 delegate fixture construction to a single source of truth.
 
-Subprocess wrappers and synthetic git-repo builders live here as standalone
+Subprocess wrappers and synthetic git repository builders live here as standalone
 helpers so scenarios remain importable without sys.path manipulation. The
 `tests/functional/` package contains its own (similar) helpers tuned for
 its specific lifecycle assumptions; the two coexist intentionally and

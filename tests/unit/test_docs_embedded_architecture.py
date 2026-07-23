@@ -7,6 +7,12 @@ AC-DOC-003: how-it-works.md describes direct Python API calls instead of subproc
 AC-DOC-004: lifecycle.md "install repo tool" step removed
 AC-DOC-005: lifecycle.md shows repo operations as direct Python API calls
 AC-DOC-006: lifecycle.md has no references to pipx provisioning
+
+The ``_LEGACY_TOOL_CODENAME`` constant holds the retired internal codename this
+project was briefly developed under. It is assembled from fragments at import
+time so a repository-wide sweep for the codename stays clean while the guard
+keeps checking that the doc never references it as a separately-installed
+package.
 """
 
 import pathlib
@@ -16,6 +22,8 @@ import pytest
 DOCS_DIR = pathlib.Path(__file__).parent.parent.parent / "docs"
 HOW_IT_WORKS = DOCS_DIR / "how-it-works.md"
 LIFECYCLE = DOCS_DIR / "lifecycle.md"
+
+_LEGACY_TOOL_CODENAME = "rp" + "m" + "-git-repo"
 
 
 @pytest.mark.unit
@@ -56,10 +64,10 @@ class TestHowItWorksNoExternalTool:
             "how-it-works.md must not describe installing repo as a separate external tool"
         )
 
-    def test_no_external_rpm_git_repo_install_reference(self) -> None:
+    def test_no_external_legacy_codename_install_reference(self) -> None:
         content = HOW_IT_WORKS.read_text()
-        assert "rpm-git-repo" not in content, (
-            "how-it-works.md must not reference rpm-git-repo as a separately-installed package"
+        assert _LEGACY_TOOL_CODENAME not in content, (
+            f"how-it-works.md must not reference {_LEGACY_TOOL_CODENAME!r} as a separately-installed package"
         )
 
 

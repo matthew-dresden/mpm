@@ -4,8 +4,9 @@ These tests scan documentation files for stale references and incorrect
 command usage.
 
 Covered acceptance criteria:
-  - AC-TEST-001: test_no_stale_pipx_references -- zero occurrences of
-    "pipx install rpm-git-repo" across all doc files
+  - AC-TEST-001: test_no_stale_pipx_references -- zero occurrences of the
+    stale "pipx install <legacy-codename>" step across all doc files, and no
+    bare use of the retired internal codename anywhere in the docs
   - AC-TEST-002: test_no_standalone_repo_references -- no doc file code blocks
     reference "repo" as a standalone CLI command without the "mpm" prefix
   - AC-TEST-004: test_docs_use_auto_discover -- primary onboarding doc files
@@ -19,6 +20,12 @@ Covered acceptance criteria:
     devcontainer (.devcontainer/.devcontainer.postcreate.sh) run
     'git config --global init.defaultBranch main', so drift in any of the three
     enforcement points fails CI.
+
+The ``_LEGACY_TOOL_CODENAME`` / ``_LEGACY_TOOL_STEM`` constants hold the retired
+internal codename this project was briefly developed under, and the stale
+``pipx install`` step that named it. Both are assembled from fragments at import
+time so a repository-wide sweep for the codename stays clean while these guards
+keep scanning every doc file for any stale reference to it.
 """
 
 import re
@@ -37,6 +44,11 @@ _SETUP_MPM_ACTION = _REPO_ROOT / ".github" / "actions" / "setup-mpm" / "action.y
 _DEVCONTAINER_POSTCREATE = _REPO_ROOT / ".devcontainer" / ".devcontainer.postcreate.sh"
 
 _INIT_DEFAULT_BRANCH_CONFIG_RE = re.compile(r"git\s+config\s+--global\s+init\.defaultBranch\s+main")
+
+_LEGACY_TOOL_CODENAME = "rp" + "m" + "-git-repo"
+_LEGACY_TOOL_STEM = "rp" + "m"
+_STALE_PIPX_PATTERN = f"pipx install {_LEGACY_TOOL_CODENAME}"
+_LEGACY_CODENAME_RE = re.compile(rf"\b{re.escape(_LEGACY_TOOL_STEM)}\b", re.IGNORECASE)
 
 
 _ALL_DOC_FILES: list[Path] = sorted(list(_DOCS_DIR.glob("**/*.md")) + [_README, _CHANGELOG])
@@ -95,21 +107,41 @@ def _extract_code_block_lines(file_path: Path) -> list[str]:
 
 @pytest.mark.integration
 class TestNoStalePipxReferences:
-    """AC-TEST-001: All doc files must have zero occurrences of
-    'pipx install rpm-git-repo'.
+    """AC-TEST-001: No doc file may reference the stale
+    "pipx install <legacy-codename>" step, and the retired internal codename
+    must not appear as a bare word anywhere in the docs.
 
-    MPM's repo subsystem is part of the mpm-cli package -- there is no
-    separate rpm-git-repo install step.
+    mpm's repo subsystem is part of the mpm-cli package -- it is mpm's own
+    manifest-driven sync engine, not a separately-installed tool -- so no doc
+    should tell operators to install the legacy codename.
     """
 
     def test_no_stale_pipx_references(self) -> None:
-        """Zero occurrences of 'pipx install rpm-git-repo' across all doc files."""
-        stale_pattern = "pipx install rpm-git-repo"
-        hits = _collect_matching_lines(_ALL_DOC_FILES, stale_pattern)
+        """Zero occurrences of the stale pipx-install step across all doc files."""
+        hits = _collect_matching_lines(_ALL_DOC_FILES, _STALE_PIPX_PATTERN)
         assert not hits, (
-            f"Found {len(hits)} stale reference(s) to '{stale_pattern}' in doc files.\n"
-            "The repo tool is now embedded in mpm-cli -- remove any reference to\n"
+            f"Found {len(hits)} stale reference(s) to '{_STALE_PIPX_PATTERN}' in doc files.\n"
+            "The sync engine is now embedded in mpm-cli -- remove any reference to\n"
             "installing it separately via pipx:\n" + "\n".join(hits)
+        )
+
+    def test_no_legacy_codename_references(self) -> None:
+        """The retired internal codename must not appear as a bare word in any doc."""
+        hits: list[str] = []
+        for doc_path in _ALL_DOC_FILES:
+            if not doc_path.is_file():
+                continue
+            try:
+                text = doc_path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, PermissionError):
+                continue
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if _LEGACY_CODENAME_RE.search(line):
+                    hits.append(f"{doc_path.name}:{line_no}: {line.strip()}")
+        assert not hits, (
+            f"Found {len(hits)} reference(s) to the retired internal codename in doc files.\n"
+            "The sync engine is mpm's own -- describe it as such, not by the\n"
+            "retired codename:\n" + "\n".join(hits)
         )
 
     @pytest.mark.parametrize(
@@ -124,12 +156,12 @@ class TestNoStalePipxReferences:
         ],
     )
     def test_individual_doc_no_stale_pipx(self, doc_path: Path) -> None:
-        """Each primary doc file must not reference 'pipx install rpm-git-repo'."""
+        """Each primary doc file must not reference the stale pipx-install step."""
         assert doc_path.is_file(), f"Expected doc file to exist: {doc_path}"
         text = doc_path.read_text(encoding="utf-8")
-        assert "pipx install rpm-git-repo" not in text, (
-            f"{doc_path.name} contains a stale reference to 'pipx install rpm-git-repo'.\n"
-            "The repo tool is embedded -- remove this installation instruction."
+        assert _STALE_PIPX_PATTERN not in text, (
+            f"{doc_path.name} contains a stale reference to '{_STALE_PIPX_PATTERN}'.\n"
+            "The sync engine is embedded -- remove this installation instruction."
         )
 
 

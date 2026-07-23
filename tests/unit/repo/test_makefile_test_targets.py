@@ -1,6 +1,6 @@
 """Tests for Makefile test, test-unit, test-functional, and validate targets.
 
-Validates that the git-repo Makefile test targets invoke pytest with the
+Validates that the project Makefile test targets invoke pytest with the
 correct options: coverage for test, -m unit for test-unit, -m functional
 for test-functional, and validate composes check + test.
 

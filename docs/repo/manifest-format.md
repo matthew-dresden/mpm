@@ -531,7 +531,7 @@ Combining `exclude` with glob patterns in `src` is also an error.
 Example:
 
     <linkfile src="common/example/cli-agent"
-              dest="${CLAUDE_MARKETPLACES_DIR}/rpm-claude-example"
+              dest="${CLAUDE_MARKETPLACES_DIR}/mpm-claude-example"
               exclude="tests,docs,__pycache__" />
 
 **Auto-skipped entries:** When `exclude` is present, the following
@@ -542,7 +542,7 @@ whether they appear in the `exclude` value:
 |---|---|---|
 | `.git` | Always skipped | Git internal directory |
 | `.repo`, `.repo*` | Always skipped | Repo tool internal directories |
-| `.packages` | Always skipped | RPM package sync directory |
+| `.packages` | Always skipped | mpm package sync directory |
 | `.config`, `.env`, etc. | Symlinked normally | May be legitimate plugin content |
 | User-specified excludes | Skipped | Controlled by `exclude` attribute |
 

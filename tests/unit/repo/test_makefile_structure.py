@@ -1,6 +1,6 @@
 """Tests for Makefile structure and targets.
 
-Validates that the git-repo Makefile follows the required conventions:
+Validates that the project Makefile follows the required conventions:
 - Bash shell with strict error handling
 - All required targets declared as .PHONY
 - help target prints target descriptions
